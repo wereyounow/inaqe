@@ -2,6 +2,9 @@ const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, ActionRowBui
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
+const { execFile } = require('child_process');
+const sharp = require('sharp');
 
 // ========== Settings ==========
 const USER_AGENTS = [
@@ -13,7 +16,7 @@ const USER_AGENTS = [
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'.';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'YwNTQ0NTc2Mw.Go-C1s.K4PdmeVO538wGP9wyoZU440_Xt_5R7ewuQNc';
 const CLIENT_ID       = process.env.CLIENT_ID || '1515303677605445763';
 
 if (!TOKEN_PINTEREST) {
@@ -115,18 +118,82 @@ async function withRetry(fn, maxRetries = 4) {
     throw lastErr;
 }
 
+const VIDEO_EXTS = new Set(['mp4', 'webm', 'mov', 'avi', 'mkv', 'm4v', 'flv']);
+
 function getImageFormat(url, buffer = null) {
-    if (buffer && buffer.length >= 4) {
+    if (buffer && buffer.length >= 12) {
+        // GIF
         if (buffer[0] === 0x47 && buffer[1] === 0x49 && buffer[2] === 0x46) return 'gif';
+        // PNG
         if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4E && buffer[3] === 0x47) return 'png';
+        // JPEG
         if (buffer[0] === 0xFF && buffer[1] === 0xD8 && buffer[2] === 0xFF) return 'jpg';
-        if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46) return 'webp';
+        // WebP
+        if (buffer[0] === 0x52 && buffer[1] === 0x49 && buffer[2] === 0x46 && buffer[3] === 0x46 &&
+            buffer[8] === 0x57 && buffer[9] === 0x45 && buffer[10] === 0x42 && buffer[11] === 0x50) return 'webp';
+        // MP4 / MOV (ftyp box)
+        if (buffer[4] === 0x66 && buffer[5] === 0x74 && buffer[6] === 0x79 && buffer[7] === 0x70) return 'mp4';
+        // WebM (EBML header)
+        if (buffer[0] === 0x1A && buffer[1] === 0x45 && buffer[2] === 0xDF && buffer[3] === 0xA3) return 'webm';
     }
     if (url) {
         const ext = url.split('.').pop().toLowerCase().split('?')[0];
+        if (VIDEO_EXTS.has(ext)) return ext;
         if (['gif', 'png', 'jpg', 'jpeg', 'webp'].includes(ext)) return ext === 'jpeg' ? 'jpg' : ext;
     }
     return 'jpg';
+}
+
+// ========== Video → GIF Conversion ==========
+function videoToGif(videoBuffer, videoExt) {
+    return new Promise((resolve, reject) => {
+        const tmpDir   = os.tmpdir();
+        const inFile   = path.join(tmpDir, `pin_in_${Date.now()}.${videoExt}`);
+        const outFile  = path.join(tmpDir, `pin_out_${Date.now()}.gif`);
+        const palFile  = path.join(tmpDir, `pin_pal_${Date.now()}.png`);
+
+        try { fs.writeFileSync(inFile, videoBuffer); } catch (e) { return reject(e); }
+
+        const cleanup = () => {
+            for (const f of [inFile, outFile, palFile]) {
+                try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
+            }
+        };
+
+        // Step 1: generate palette for better GIF quality
+        execFile('ffmpeg', [
+            '-y', '-i', inFile,
+            '-vf', 'fps=12,scale=480:-1:flags=lanczos,palettegen=max_colors=128',
+            palFile
+        ], { timeout: 30000 }, (err) => {
+            if (err) {
+                cleanup();
+                return reject(new Error(`palette gen failed: ${err.message}`));
+            }
+
+            // Step 2: convert video to GIF using palette
+            execFile('ffmpeg', [
+                '-y', '-i', inFile, '-i', palFile,
+                '-lavfi', 'fps=12,scale=480:-1:flags=lanczos[x];[x][1:v]paletteuse=dither=bayer',
+                '-t', '15',
+                outFile
+            ], { timeout: 60000 }, (err2) => {
+                if (err2) {
+                    cleanup();
+                    return reject(new Error(`video→gif failed: ${err2.message}`));
+                }
+
+                try {
+                    const gif = fs.readFileSync(outFile);
+                    cleanup();
+                    resolve(gif);
+                } catch (e) {
+                    cleanup();
+                    reject(e);
+                }
+            });
+        });
+    });
 }
 
 // Extract the unique image identifier from a Pinterest URL.
@@ -384,6 +451,120 @@ async function updatePinterestAvatar() {
         if (result.size < 1000) {
             console.warn('⚠️ Image too small, skipping');
             return;
+        }
+
+        // ── Video → GIF ──────────────────────────────────────
+        if (VIDEO_EXTS.has(result.format)) {
+            console.log(`🎬 Video detected (${result.format.toUpperCase()}, ${(result.size / 1024).toFixed(1)}KB) — converting to GIF...`);
+            try {
+                const gifBuffer = await videoToGif(result.buffer, result.format);
+                result.buffer = gifBuffer;
+                result.size   = gifBuffer.length;
+                result.format = 'gif';
+                console.log(`✅ Converted to GIF: ${(result.size / 1024).toFixed(1)}KB`);
+            } catch (convErr) {
+                console.warn(`⚠️ Video→GIF failed: ${convErr.message}, skipping`);
+                return;
+            }
+        }
+
+        const MAX_DISCORD_SIZE = 8 * 1024 * 1024; // 8MB Discord limit
+        if (result.size > MAX_DISCORD_SIZE) {
+            console.warn(`⚠️ Image too large (${(result.size / 1024 / 1024).toFixed(2)}MB), resizing...`);
+            try {
+                const isGif = result.format === 'gif';
+                let resized = null;
+
+                if (isGif) {
+                    // GIF: try reducing size step by step while keeping animation
+                    const gifSteps = [
+                        { width: 800 },
+                        { width: 640 },
+                        { width: 512 },
+                        { width: 400 },
+                        { width: 320 },
+                        { width: 256 },
+                        { width: 192 },
+                        { width: 128 },
+                    ];
+                    for (const step of gifSteps) {
+                        resized = await sharp(result.buffer, { animated: true })
+                            .resize({ width: step.width, withoutEnlargement: true })
+                            .gif()
+                            .toBuffer();
+                        console.log(`  🔁 GIF → ${step.width}px = ${(resized.length / 1024).toFixed(1)}KB`);
+                        if (resized.length <= MAX_DISCORD_SIZE) break;
+                    }
+
+                    // GIF احتياطي: تحويل لـ JPEG ثابت بخطوات تدريجية
+                    if (resized && resized.length > MAX_DISCORD_SIZE) {
+                        console.warn('⚠️ GIF لا يزال كبيراً — تحويل لـ JPEG ثابت...');
+                        const jpegSteps = [
+                            { width: 1920, quality: 90 },
+                            { width: 1280, quality: 85 },
+                            { width: 1024, quality: 80 },
+                            { width: 800,  quality: 75 },
+                        ];
+                        for (const step of jpegSteps) {
+                            resized = await sharp(result.buffer, { animated: false })
+                                .resize({ width: step.width, withoutEnlargement: true })
+                                .jpeg({ quality: step.quality })
+                                .toBuffer();
+                            console.log(`  🔁 GIF→JPEG ${step.width}px q${step.quality} = ${(resized.length / 1024).toFixed(1)}KB`);
+                            if (resized.length <= MAX_DISCORD_SIZE) break;
+                        }
+                        result.format = 'jpg';
+                    }
+                } else {
+                    // Static image: try quality reduction first, then width reduction
+                    const steps = [
+                        { width: 4096, quality: 90 },
+                        { width: 3000, quality: 85 },
+                        { width: 2560, quality: 85 },
+                        { width: 1920, quality: 85 },
+                        { width: 1600, quality: 85 },
+                        { width: 1280, quality: 85 },
+                        { width: 1280, quality: 80 },
+                        { width: 1024, quality: 80 },
+                        { width: 1024, quality: 75 },
+                        { width: 800,  quality: 75 },
+                        { width: 800,  quality: 70 },
+                    ];
+                    for (const step of steps) {
+                        resized = await sharp(result.buffer)
+                            .resize({ width: step.width, withoutEnlargement: true })
+                            .jpeg({ quality: step.quality })
+                            .toBuffer();
+                        console.log(`  🔁 ${step.width}px q${step.quality} = ${(resized.length / 1024).toFixed(1)}KB`);
+                        if (resized.length <= MAX_DISCORD_SIZE) break;
+                    }
+                    result.format = 'jpg';
+                }
+
+                // ── Safety fallback: force under 8MB no matter what ──
+                if (resized && resized.length > MAX_DISCORD_SIZE) {
+                    console.warn('⚠️ Still over 8MB — applying emergency fallback...');
+                    let quality = 65;
+                    let width   = 640;
+                    while (resized.length > MAX_DISCORD_SIZE && quality >= 10) {
+                        resized = await sharp(resized)
+                            .resize({ width, withoutEnlargement: true })
+                            .jpeg({ quality })
+                            .toBuffer();
+                        console.log(`  🆘 fallback ${width}px q${quality} = ${(resized.length / 1024).toFixed(1)}KB`);
+                        quality -= 10;
+                        width    = Math.max(Math.floor(width * 0.8), 128);
+                    }
+                    result.format = 'jpg';
+                }
+
+                result.buffer = resized;
+                result.size   = resized.length;
+                console.log(`✅ Final size: ${(result.size / 1024).toFixed(1)}KB`);
+            } catch (resizeErr) {
+                console.warn(`⚠️ Resize failed: ${resizeErr.message}, skipping`);
+                return;
+            }
         }
 
         console.log(`📦 ${(result.size / 1024).toFixed(1)}KB | ${result.format.toUpperCase()}`);
