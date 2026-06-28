@@ -1,4 +1,4 @@
-const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType, SlashCommandBuilder, REST, Routes } = require('discord.js');
+const { Client, GatewayIntentBits, EmbedBuilder, AttachmentBuilder, ActionRowBuilder, ButtonBuilder, ButtonStyle, ActivityType, SlashCommandBuilder, REST, Routes, MessageFlags } = require('discord.js');
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
@@ -25,7 +25,7 @@ const USER_AGENTS = [
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'zg4MzE4MzY5Mzg2NA.GLw68H.hDnOI0L1fcnfiXqYWrSQb6wTUhzh0mr-wOVXg4';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'MzE4MzY5Mzg2NA.GLw68H.hDnOI0L1fcnfiXqYWrSQb6wTUhzh0mr-wOVXg4';
 const CLIENT_ID       = process.env.CLIENT_ID || '1481717883183693864';
 
 if (!TOKEN_PINTEREST) {
@@ -40,7 +40,7 @@ const PINTEREST_CHANNEL_ID = '1484325879764226109';
 const DEVELOPER_IDS = ['1384688131374317598', '1471245404501839966'];
 
 // ========== Image Settings ==========
-const DEFAULT_KEYWORDS        = ['chainsawman icon', 'chainsawan aki Icon', 'Lara Croft icon', 'Cat icon'];
+const DEFAULT_KEYWORDS        = ['full images'];
 const PINTEREST_CHANGE_INTERVAL = 30;   // seconds between posts
 const QUEUE_MIN               = 20;      // refill when queue drops below this
 const QUEUE_TARGET            = 100;      // how many URLs to keep ready
@@ -638,7 +638,7 @@ function buildCarouselEmbed(cdnUrl, keyword, page, total) {
         .setDescription(`🔍 \`${keyword}\``)
         .setImage(cdnUrl)
         .setColor('#E60023')
-        .setFooter({ text: `🖼️  ${page + 1} / ${total}` });
+        .setFooter({ text: `${page + 1} / ${total}` });
 }
 
 function buildCarouselComponents(msgId, page, total) {
@@ -657,7 +657,7 @@ function buildCarouselComponents(msgId, page, total) {
             .setCustomId(`c_next_${msgId}`)
             .setLabel('التالي ▶')
             .setStyle(ButtonStyle.Primary)
-            .setDisabled(page === total - 1),
+         //   .setDisabled(page === total - 1),
     )];
 }
 
@@ -701,36 +701,53 @@ async function updatePinterestAvatar() {
             catch (err) { console.error(`❌ Could not access channel: ${err.message}`); return; }
         }
         const MAX_DISCORD_SIZE = 8 * 1024 * 1024;
-        const files = [];
-        for (let i = 0; i < Math.min(item.urls.length, 10); i++) {
+        const sourceUrls = item.urls.slice(0, 10);
+        const total      = sourceUrls.length;
+
+        // Download and upload ONLY the first image — try each URL until one works
+        let firstBuf, firstFmt, firstIndex = -1;
+        for (let i = 0; i < sourceUrls.length; i++) {
             try {
-                const dl = await downloadImage(item.urls[i]);
-                let buf = dl.buffer, fmt = dl.format;
+                const dl = await downloadImage(sourceUrls[i]);
+                firstBuf = dl.buffer; firstFmt = dl.format;
                 if (dl.size > MAX_DISCORD_SIZE) {
-                    buf = await sharp(buf).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
-                    fmt = 'jpg';
+                    firstBuf = await sharp(firstBuf).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+                    firstFmt = 'jpg';
                 }
-                files.push(new AttachmentBuilder(buf, { name: `carousel_${i + 1}.${fmt}` }));
+                firstIndex = i;
+                break;
             } catch (e) {
                 console.warn(`⚠️ Carousel image ${i + 1} failed: ${e.message}`);
             }
         }
-        if (files.length === 0) { console.error('❌ All carousel images failed'); return; }
+        if (firstIndex === -1) { console.error('❌ All carousel images failed'); return; }
+        // Reorder so the working image is first
+        const orderedUrls = [sourceUrls[firstIndex], ...sourceUrls.filter((_, i) => i !== firstIndex)];
 
-        // Upload all files first to obtain permanent Discord CDN URLs
-        const sent = await channel.send({ files });
-        const cdnUrls = [...sent.attachments.values()].map(a => a.url);
-        const total   = cdnUrls.length;
+        const firstName = `image.${firstFmt}`;
 
-        // Edit the message to show paginated embed (page 1) + nav buttons
-        await sent.edit({
-            embeds:     [buildCarouselEmbed(cdnUrls[0], item.keyword, 0, total)],
-            components: buildCarouselComponents(sent.id, 0, total),
+        // Send with file + embed using attachment:// — buttons added after we have the message ID
+        const sent = await channel.send({
+            files:  [new AttachmentBuilder(firstBuf, { name: firstName })],
+            embeds: [buildCarouselEmbed(`attachment://${firstName}`, item.keyword, 0, total)],
         });
 
-        // Store session for button interactions (auto-expire after 30 min)
-        carouselSessions.set(sent.id, { cdnUrls, page: 0, keyword: item.keyword, total });
+        const firstCdnUrl = [...sent.attachments.values()][0]?.url ?? '';
+        const cdnCache    = { 0: firstCdnUrl };
+
+        // Register session BEFORE editing so buttons work even if edit is slow
+        carouselSessions.set(sent.id, { cdnCache, sourceUrls: orderedUrls, page: 0, keyword: item.keyword, total });
         setTimeout(() => carouselSessions.delete(sent.id), 30 * 60 * 1000);
+
+        // Edit to use CDN URL (persistent) + proper nav buttons with real message ID
+        try {
+            await sent.edit({
+                embeds:     [buildCarouselEmbed(firstCdnUrl || `attachment://${firstName}`, item.keyword, 0, total)],
+                components: buildCarouselComponents(sent.id, 0, total),
+            });
+        } catch (editErr) {
+            console.warn(`⚠️ Carousel edit failed (buttons may be missing): ${editErr.message}`);
+        }
 
         console.log(`✅ Carousel sent (${total} images, paginated) | queue: ${imageQueue.length}`);
         saveState();
@@ -886,20 +903,21 @@ async function updatePinterestAvatar() {
             files: [new AttachmentBuilder(result.buffer, { name: imgName })],
         });
 
-        const att = sent.attachments.find(a => a.name === imgName);
-        if (att) {
+        const cdnUrl = [...sent.attachments.values()][0]?.url ?? '';
+        try {
             await sent.edit({
                 embeds: [new EmbedBuilder()
                     .setTitle('Avatar — Pinterest')
                     .setDescription(`🔍 \`${item.keyword}\``)
-                    .setURL(att.url)
-                    .setImage(`attachment://${imgName}`)
+                    .setImage(cdnUrl || `attachment://${imgName}`)
                     .setColor('#E60023')
                 ],
-                components: [new ActionRowBuilder().addComponents(
-                    new ButtonBuilder().setLabel('🖼️ Image').setURL(att.url).setStyle(ButtonStyle.Link)
-                )],
+                components: cdnUrl ? [new ActionRowBuilder().addComponents(
+                    new ButtonBuilder().setLabel('🖼️ Image').setURL(cdnUrl).setStyle(ButtonStyle.Link)
+                )] : [],
             });
+        } catch (editErr) {
+            console.warn(`⚠️ Single image edit failed: ${editErr.message}`);
         }
 
         console.log(`✅ Sent | queue: ${imageQueue.length} | seen: ${seenIds.size}`);
@@ -945,18 +963,13 @@ async function fetchPinterestGuides(keyword) {
 
         const guides = res.data?.resource_response?.data?.guides ?? [];
 
-        // Keep only style/format modifiers — reject proper nouns (capital letters)
-        // and multi-word phrases that are likely a different franchise or character.
         const terms = guides
             .map(g => g?.display_name || g?.term)
             .filter(Boolean)
             .filter(t => {
                 const words = t.trim().split(/\s+/);
-                // Skip if more than 2 words (likely a character/show name)
                 if (words.length > 2) return false;
-                // Skip if any word starts with uppercase (likely a proper noun)
                 if (words.some(w => /^[A-Z]/.test(w))) return false;
-                // Skip if the term already appears in the keyword (redundant)
                 if (keyword.toLowerCase().includes(t.toLowerCase())) return false;
                 return true;
             })
@@ -969,10 +982,9 @@ async function fetchPinterestGuides(keyword) {
             return variants;
         }
     } catch (err) {
-        console.warn(`⚠️ Could not fetch guides for "${keyword}": ${err.message}`);
+        console.log(`ℹ️ Guides unavailable for "${keyword}" (${err.message}) — using keyword as-is`);
     }
 
-    // No valid guides found — use the keyword as-is without guessing expansions
     guidedCache[keyword] = [keyword];
     return [keyword];
 }
@@ -1060,7 +1072,7 @@ async function replyError(interaction, now, description) {
             .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
             .setTimestamp(now)
         ],
-        ephemeral: true
+        flags: MessageFlags.Ephemeral,
     };
     try {
         if (interaction.replied || interaction.deferred) await interaction.followUp(payload);
@@ -1079,18 +1091,77 @@ pinterestBot.on('interactionCreate', async (interaction) => {
     const session     = carouselSessions.get(sessionId);
 
     if (!session) {
-        return interaction.reply({ content: '⏱️ انتهت صلاحية هذا الكاروسيل.', ephemeral: true });
+        return interaction.reply({
+            embeds: [new EmbedBuilder()
+                .setColor('#ED4245')
+                .setTitle('⏱️ انتهت صلاحية الكاروسيل')
+                .setDescription('هذا الكاروسيل قديم ولم يعد متاحاً.\nالصور الجديدة تُرسل كل **30 ثانية** تلقائياً.')
+                .setFooter({ text: 'تنتهي صلاحية الكاروسيل بعد 30 دقيقة' })
+            ],
+            flags: MessageFlags.Ephemeral,
+        });
     }
 
     session.page = isPrev
         ? Math.max(0, session.page - 1)
         : Math.min(session.total - 1, session.page + 1);
 
+    const page = session.page;
+
     try {
-        await interaction.update({
-            embeds:     [buildCarouselEmbed(session.cdnUrls[session.page], session.keyword, session.page, session.total)],
-            components: buildCarouselComponents(sessionId, session.page, session.total),
-        });
+        // Use cached CDN URL if available
+        if (session.cdnCache[page]) {
+            await interaction.update({
+                embeds:     [buildCarouselEmbed(session.cdnCache[page], session.keyword, page, session.total)],
+                components: buildCarouselComponents(sessionId, page, session.total),
+            });
+        } else {
+            // Download image on-demand from the post's own URLs only
+            await interaction.deferUpdate();
+            const MAX_DISCORD_SIZE = 8 * 1024 * 1024;
+            let buf, fmt, loaded = false;
+
+            // Smart retry: try only URLs belonging to this post
+            for (const srcUrl of [session.sourceUrls[page], ...session.sourceUrls.filter((_, i) => i !== page && !session.cdnCache[i])]) {
+                try {
+                    const dl = await downloadImage(srcUrl);
+                    buf = dl.buffer; fmt = dl.format;
+                    if (dl.size > MAX_DISCORD_SIZE) {
+                        buf = await sharp(buf).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+                        fmt = 'jpg';
+                    }
+                    loaded = true;
+                    break;
+                } catch { continue; }
+            }
+
+            if (!loaded) {
+                // All URLs from this post failed — inform user via ephemeral embed
+                return interaction.followUp({
+                    embeds: [new EmbedBuilder()
+                        .setColor('#FEE75C')
+                        .setTitle('⚠️ تعذّر تحميل الصورة')
+                        .setDescription('هذه الصورة غير متاحة حالياً من Pinterest.\nجرّب صفحة أخرى.')
+                    ],
+                    flags: MessageFlags.Ephemeral,
+                });
+            }
+
+            const fileName = `image.${fmt}`;
+            const edited = await interaction.message.edit({
+                files:      [new AttachmentBuilder(buf, { name: fileName })],
+                embeds:     [buildCarouselEmbed(`attachment://${fileName}`, session.keyword, page, session.total)],
+                components: buildCarouselComponents(sessionId, page, session.total),
+            });
+            const cdnUrl = [...edited.attachments.values()][0]?.url ?? '';
+            if (cdnUrl) session.cdnCache[page] = cdnUrl;
+            if (cdnUrl) {
+                await edited.edit({
+                    embeds:     [buildCarouselEmbed(cdnUrl, session.keyword, page, session.total)],
+                    components: buildCarouselComponents(sessionId, page, session.total),
+                });
+            }
+        }
     } catch (err) {
         console.error(`❌ Carousel button update failed: ${err.message}`);
     }
@@ -1125,7 +1196,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp()
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     }
 
@@ -1166,7 +1237,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /clearcache error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1192,7 +1263,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /help error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1225,7 +1296,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /mode error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1244,7 +1315,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral,
             });
         }
 
@@ -1276,7 +1347,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /addkeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1302,7 +1373,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /keywords error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1322,7 +1393,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral,
             });
         }
 
@@ -1337,7 +1408,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral,
             });
         }
 
@@ -1364,7 +1435,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /removekeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1395,7 +1466,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /expandkeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 
@@ -1416,7 +1487,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral,
             });
         }
 
@@ -1431,7 +1502,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral,
             });
         }
 
@@ -1446,7 +1517,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
-                ephemeral: true
+                flags: MessageFlags.Ephemeral,
             });
         }
 
@@ -1489,7 +1560,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
             ],
-            ephemeral: true
+            flags: MessageFlags.Ephemeral,
         });
     } catch (err) { console.error(`❌ /editkeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 });
@@ -1581,7 +1652,7 @@ async function fetchImagesFromPinUrl(pinUrl) {
 }
 
 // ========== Bot Startup ==========
-pinterestBot.once('ready', async () => {
+pinterestBot.once('clientReady', async () => {
     console.log(`✅ Pinterest bot ready: ${pinterestBot.user.username}`);
 
     const updatePresence = () => pinterestBot.user.setPresence({
