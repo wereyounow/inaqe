@@ -9,15 +9,24 @@ const sharp = require('sharp');
 // ========== Settings ==========
 const USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14.4; rv:124.0) Gecko/20100101 Firefox/124.0',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 14_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Safari/605.1.15',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36 Edg/125.0.0.0',
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'YwNTQ0NTc2Mw.Go-C1s.K4PdmeVO538wGP9wyoZU440_Xt_5R7ewuQNc';
-const CLIENT_ID       = process.env.CLIENT_ID || '1515303677605445763';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'MTQ4MTcxzE4MzY5Mzg2NA.GAVqqG.MotfSK_4UrPFpxlABC39p34JAlSxN8WU1732tk';
+const CLIENT_ID       = process.env.CLIENT_ID || '1481717883183693864';
 
 if (!TOKEN_PINTEREST) {
     console.error('❌ TOKEN_PINTEREST must be set in environment variables');
@@ -47,12 +56,16 @@ const STATE_BACKUP_FILE = STATE_FILE + '.backup';
 let keywords         = [...DEFAULT_KEYWORDS];
 let keywordMode      = 'random';
 let _keywordIndex    = 0;
+let autoExpand       = true;     // whether to auto-expand keywords via guided search when filling queue
 let keywordBookmarks = {};       // keyword -> Pinterest bookmark token
 let seenIds          = new Set(); // unique image IDs ever sent (dedup by content, not URL)
 
 // In-memory queue of { url, keyword } items ready to post
 let imageQueue    = [];
 let isFetching    = false;
+
+// URLs that failed all download retries — skip them permanently this session
+const failedUrls  = new Set();
 
 function loadState() {
     for (const file of [STATE_FILE, STATE_BACKUP_FILE]) {
@@ -62,6 +75,7 @@ function loadState() {
                 keywords         = data.keywords         ?? [...DEFAULT_KEYWORDS];
                 keywordMode      = data.keywordMode      ?? 'random';
                 _keywordIndex    = data.keywordIndex     ?? 0;
+                autoExpand       = data.autoExpand       ?? true;
                 keywordBookmarks = data.keywordBookmarks ?? {};
                 seenIds          = new Set(data.seenIds ?? []);
                 console.log(`📂 State loaded | Seen: ${seenIds.size} | Keywords: ${keywords.length} | Mode: ${keywordMode}`);
@@ -79,7 +93,7 @@ function loadState() {
 function saveState() {
     try {
         const seenArr = [...seenIds].slice(-SEEN_MAX);
-        const data = JSON.stringify({ keywords, keywordMode, keywordIndex: _keywordIndex, keywordBookmarks, seenIds: seenArr }, null, 2);
+        const data = JSON.stringify({ keywords, keywordMode, keywordIndex: _keywordIndex, autoExpand, keywordBookmarks, seenIds: seenArr }, null, 2);
         if (fs.existsSync(STATE_FILE)) fs.copyFileSync(STATE_FILE, STATE_BACKUP_FILE);
         fs.writeFileSync(STATE_FILE, data, 'utf8');
     } catch (err) {
@@ -110,8 +124,11 @@ async function withRetry(fn, maxRetries = 4) {
         } catch (err) {
             lastErr = err;
             if (i < maxRetries - 1) {
-                const delay = Math.min(1000 * Math.pow(2, i), 10000);
-                await new Promise(r => setTimeout(r, delay));
+                const is429  = err?.response?.status === 429;
+                const base   = is429 ? 30000 : Math.min(1000 * Math.pow(2, i), 10000);
+                const jitter = Math.floor(Math.random() * 500);
+                if (is429) console.warn(`⚠️ Rate limited by Pinterest — waiting ${((base + jitter) / 1000).toFixed(1)}s...`);
+                await new Promise(r => setTimeout(r, base + jitter));
             }
         }
     }
@@ -210,6 +227,17 @@ function getPinImageId(url) {
     }
 }
 
+// Upgrade a Pinterest CDN URL from a sized path to full-resolution originals.
+// e.g. https://i.pinimg.com/736x/ab/cd/ef/img.jpg
+//   → https://i.pinimg.com/originals/ab/cd/ef/img.jpg
+function upgradeToOriginals(url) {
+    try {
+        return url.replace(/\/\d+x\//, '/originals/');
+    } catch {
+        return url;
+    }
+}
+
 function pickKeyword() {
     if (keywords.length === 0) return DEFAULT_KEYWORDS[0];
     if (keywordMode === 'sequential') {
@@ -221,6 +249,59 @@ function pickKeyword() {
 }
 
 // ========== Pinterest API ==========
+
+// Pick the highest-quality static image URL from a pin's images object.
+function bestImageUrl(images) {
+    if (!images) return null;
+    return (
+        images?.orig?.url      ||
+        images?.['1200x']?.url ||
+        images?.['736x']?.url  ||
+        images?.['600x']?.url  ||
+        images?.['474x']?.url  ||
+        images?.['236x']?.url  ||
+        null
+    );
+}
+
+// Pick the highest-quality video URL from a pin's video_list object.
+// Pinterest orders video_list keys like V_720P, V_480P, V_360P, V_HLS …
+function bestVideoUrl(videoList) {
+    if (!videoList || typeof videoList !== 'object') return null;
+    // HLS (.m3u8) playlists can't be downloaded with a simple GET — skip them
+    const isDownloadable = url => url?.startsWith('http') && !url.includes('.m3u8');
+    const PREF = ['V_720P', 'V_480P', 'V_360P'];
+    for (const key of PREF) {
+        const url = videoList[key]?.url;
+        if (isDownloadable(url)) return url;
+    }
+    // Fallback: take the first directly downloadable URL
+    for (const val of Object.values(videoList)) {
+        if (isDownloadable(val?.url)) return val.url;
+    }
+    return null;
+}
+
+// Build realistic browser headers for a given UA to reduce Pinterest blocking.
+function pinterestHeaders(ua, keyword) {
+    return {
+        'User-Agent':              ua,
+        'Accept':                  'application/json, text/javascript, */*; q=0.01',
+        'Accept-Language':         'en-US,en;q=0.9',
+        'Accept-Encoding':         'gzip, deflate, br',
+        'X-Requested-With':        'XMLHttpRequest',
+        'x-pinterest-pws-handler': 'www/search/[scope].js',
+        'x-app-version':           '1.0',
+        'DNT':                     '1',
+        'Cache-Control':           'no-cache',
+        'Pragma':                  'no-cache',
+        'sec-fetch-dest':          'empty',
+        'sec-fetch-mode':          'cors',
+        'sec-fetch-site':          'same-origin',
+        'Referer': `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(keyword)}`,
+    };
+}
+
 async function fetchPinterestPage(keyword, bookmark) {
     const ua = randomUA();
     const source_url = `/search/pins/?q=${encodeURIComponent(keyword)}&rs=typed`;
@@ -228,7 +309,7 @@ async function fetchPinterestPage(keyword, bookmark) {
         options: {
             query: keyword,
             scope: 'pins',
-            page_size: 50,
+            page_size: 250,           // up from 50 — fewer round-trips
             bookmarks: bookmark ? [bookmark] : [],
             article: '',
             appliedProductFilters: '---',
@@ -244,28 +325,39 @@ async function fetchPinterestPage(keyword, bookmark) {
 
     const res = await axios.get(url, {
         timeout: 20000,
-        headers: {
-            'User-Agent': ua,
-            'Accept': 'application/json, text/javascript, */*; q=0.01',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'X-Requested-With': 'XMLHttpRequest',
-            'x-pinterest-pws-handler': 'www/search/[scope].js',
-            'Referer': `https://www.pinterest.com/search/pins/?q=${encodeURIComponent(keyword)}`,
-        },
+        headers: pinterestHeaders(ua, keyword),
     });
 
-    const results     = res.data?.resource_response?.data?.results ?? [];
+    // Validate API-level status (Pinterest returns 200 HTTP even on soft errors)
+    const apiStatus = res.data?.resource_response?.status;
+    if (apiStatus && apiStatus !== 'success') {
+        throw new Error(`Pinterest API status: ${apiStatus}`);
+    }
+
+    const results      = res.data?.resource_response?.data?.results ?? [];
     const nextBookmark = res.data?.resource_response?.bookmark ?? null;
 
-    // Prefer highest-quality image available
-    const urls = results
-        .map(r => {
-            const img = r?.images;
-            return img?.orig?.url || img?.['736x']?.url || img?.['474x']?.url;
-        })
-        .filter(u => u?.startsWith('http'));
+    const items = [];
+    for (const r of results) {
+        // Skip promoted / ad pins — they're often low-quality or off-topic
+        if (r?.promoted_pin_presenters?.length || r?.ad_destination_url) continue;
 
-    return { urls, nextBookmark };
+        const pinId = r?.id ? String(r.id) : null;
+
+        // 1. Try video URL first (richer content)
+        const videoList = r?.videos?.video_list;
+        const videoUrl  = bestVideoUrl(videoList);
+        if (videoUrl) {
+            items.push({ url: videoUrl, pinId });
+            continue;
+        }
+
+        // 2. Fall back to best static image, upgraded to originals resolution
+        const imgUrl = bestImageUrl(r?.images);
+        if (imgUrl) items.push({ url: upgradeToOriginals(imgUrl), pinId });
+    }
+
+    return { items, nextBookmark };
 }
 
 // ========== Queue Filler ==========
@@ -279,6 +371,18 @@ async function fillQueue() {
         const needed = QUEUE_TARGET - imageQueue.length;
         if (needed <= 0) { isFetching = false; return; }
 
+        // If auto-expand is on, discover guided search variants and add new ones before fetching
+        if (autoExpand) {
+            const base = keywords.length > 0 ? [...keywords] : DEFAULT_KEYWORDS;
+            for (const kw of base) {
+                const variants = await expandKeyword(kw).catch(() => []);
+                const toAdd = variants.filter(v => v !== kw && !keywords.includes(v));
+                for (const v of toAdd) keywords.push(v);
+                if (toAdd.length > 0) console.log(`🔍 Auto-expanded "${kw}" → +${toAdd.length} variants`);
+            }
+            if (keywords.some((_,i) => i >= base.length)) saveState();
+        }
+
         // Fetch from every keyword in parallel, each responsible for its share
         const kwList = keywords.length > 0 ? keywords : DEFAULT_KEYWORDS;
         const perKw  = Math.ceil(needed / kwList.length);
@@ -289,6 +393,12 @@ async function fillQueue() {
         let added = 0;
         for (const r of results) {
             if (r.status === 'fulfilled') added += r.value;
+        }
+
+        // Shuffle queue so items from different keywords interleave instead of batching
+        for (let i = imageQueue.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [imageQueue[i], imageQueue[j]] = [imageQueue[j], imageQueue[i]];
         }
 
         console.log(`✅ Queue filled: +${added} new | total ready: ${imageQueue.length}`);
@@ -312,12 +422,12 @@ async function fetchOneKeyword(keyword, needed = QUEUE_TARGET) {
         const bookmark = keywordBookmarks[keyword] ?? null;
 
         try {
-            const { urls, nextBookmark } = await withRetry(
+            const { items, nextBookmark } = await withRetry(
                 (attempt) => fetchPinterestPage(keyword, attempt === 0 ? bookmark : null),
                 4
             );
 
-            if (!urls || urls.length === 0) {
+            if (!items || items.length === 0) {
                 delete keywordBookmarks[keyword];
                 console.log(`  🔁 "${keyword}" — empty page, resetting bookmark`);
                 break;
@@ -331,22 +441,22 @@ async function fetchOneKeyword(keyword, needed = QUEUE_TARGET) {
                 console.log(`  🔁 "${keyword}" — last page reached, will cycle from page 1 next fill`);
             }
 
-            // Add only images not seen before.
-            // Double check: image ID (catches same image via different size URL)
-            //             + full URL  (catches exact duplicate links)
+            // Dedup by pin ID (from API) first, then by parsed image filename as fallback.
+            // This catches the same pin served under different size URLs.
             let pageAdded = 0;
-            for (const url of urls) {
-                const id = getPinImageId(url);
-                if (!seenIds.has(id) && !seenIds.has(url)) {
-                    seenIds.add(id);   // block by image ID
-                    seenIds.add(url);  // block by exact URL too
-                    imageQueue.push({ url, keyword, id });
+            for (const { url, pinId } of items) {
+                const fileId = getPinImageId(url);
+                const dedupKey = pinId ?? fileId;
+                if (!seenIds.has(dedupKey) && !seenIds.has(fileId)) {
+                    seenIds.add(dedupKey);
+                    seenIds.add(fileId);
+                    imageQueue.push({ url, keyword, id: dedupKey });
                     pageAdded++;
                     totalAdded++;
                 }
             }
 
-            console.log(`  📌 "${keyword}" p${page + 1} → ${urls.length} found, ${pageAdded} fresh | bookmark: ${nextBookmark ? 'next' : 'end'}`);
+            console.log(`  📌 "${keyword}" p${page + 1} → ${items.length} found, ${pageAdded} fresh | bookmark: ${nextBookmark ? 'next' : 'end'}`);
 
             // If page had no fresh images and we're at end, stop early
             if (pageAdded === 0 && !nextBookmark) break;
@@ -401,22 +511,37 @@ function dequeueNext() {
 
 // ========== Image Download ==========
 async function downloadImage(url) {
-    return withRetry(async (attempt) => {
-        const response = await axios({
-            url,
-            method: 'GET',
-            responseType: 'arraybuffer',
-            headers: {
-                'User-Agent': randomUA(),
-                'Accept': 'image/png,image/gif,image/jpeg,image/webp,*/*',
-                'Referer': 'https://www.pinterest.com/',
-            },
-            timeout: 30000,
-        });
-        const buffer = Buffer.from(response.data);
-        const format = getImageFormat(url, buffer);
-        return { buffer, format, size: buffer.length };
-    }, 4);
+    // For Pinterest CDN images, try upgrading to originals first for best quality.
+    // If originals returns a non-200 (e.g. 403/404), fall back to the original URL.
+    const originalsUrl = upgradeToOriginals(url);
+    const urlsToTry    = originalsUrl !== url ? [originalsUrl, url] : [url];
+
+    let lastErr;
+    for (const tryUrl of urlsToTry) {
+        try {
+            return await withRetry(async () => {
+                const response = await axios({
+                    url: tryUrl,
+                    method: 'GET',
+                    responseType: 'arraybuffer',
+                    headers: {
+                        'User-Agent': randomUA(),
+                        'Accept': 'image/png,image/gif,image/jpeg,image/webp,*/*',
+                        'Accept-Encoding': 'gzip, deflate, br',
+                        'Referer': 'https://www.pinterest.com/',
+                    },
+                    timeout: 30000,
+                });
+                const buffer = Buffer.from(response.data);
+                const format = getImageFormat(tryUrl, buffer);
+                return { buffer, format, size: buffer.length };
+            }, 3);
+        } catch (err) {
+            lastErr = err;
+            if (urlsToTry.length > 1) console.warn(`⚠️ Download failed for ${tryUrl.includes('originals') ? 'originals' : 'sized'} URL — trying fallback...`);
+        }
+    }
+    throw lastErr;
 }
 
 // ========== Image Update ==========
@@ -441,12 +566,20 @@ async function updatePinterestAvatar() {
     const item = dequeueNext();
     if (!item) return;
 
+    // Skip permanently blacklisted URLs
+    if (failedUrls.has(item.url)) {
+        console.warn(`⛔ Skipping blacklisted URL: ${item.url}`);
+        return;
+    }
+
     const imageId = item.id ?? getPinImageId(item.url);
     console.log(`🖼️  [${item.keyword}] id: ${imageId} | queue: ${imageQueue.length} remaining`);
     console.log(`🔗 ${item.url}`);
 
+    let downloadOk = false;
     try {
         const result = await downloadImage(item.url);
+        downloadOk = true;
 
         if (result.size < 1000) {
             console.warn('⚠️ Image too small, skipping');
@@ -496,9 +629,9 @@ async function updatePinterestAvatar() {
                         if (resized.length <= MAX_DISCORD_SIZE) break;
                     }
 
-                    // GIF احتياطي: تحويل لـ JPEG ثابت بخطوات تدريجية
+                    // Fallback: convert oversized GIF to static JPEG
                     if (resized && resized.length > MAX_DISCORD_SIZE) {
-                        console.warn('⚠️ GIF لا يزال كبيراً — تحويل لـ JPEG ثابت...');
+                        console.warn('⚠️ GIF still too large — converting to static JPEG...');
                         const jpegSteps = [
                             { width: 1920, quality: 90 },
                             { width: 1280, quality: 85 },
@@ -613,9 +746,62 @@ async function updatePinterestAvatar() {
 
     } catch (err) {
         console.error(`❌ Post failed: ${err.message}`);
-        // Put the URL back if we failed to send it
-        imageQueue.unshift(item);
+        if (!downloadOk) {
+            // Download itself failed — blacklist so we never retry this URL
+            failedUrls.add(item.url);
+            console.warn(`⛔ URL blacklisted after repeated download failures: ${item.url}`);
+        } else {
+            // Download succeeded but Discord send failed — put it back to retry next cycle
+            imageQueue.unshift(item);
+        }
     }
+}
+
+// ========== Keyword Variants (from Pinterest guided search) ==========
+const guidedCache = {};
+
+async function fetchPinterestGuides(keyword) {
+    if (guidedCache[keyword]) return guidedCache[keyword];
+
+    try {
+        const ua = randomUA();
+        const source_url = `/search/pins/?q=${encodeURIComponent(keyword)}&rs=typed`;
+        const payload = JSON.stringify({
+            options: { query: keyword, scope: 'pins' },
+            context: {}
+        });
+        const url = `https://www.pinterest.com/resource/GuideSearchResource/get/?source_url=${encodeURIComponent(source_url)}&data=${encodeURIComponent(payload)}`;
+
+        const res = await axios.get(url, {
+            timeout: 15000,
+            headers: pinterestHeaders(ua, keyword),
+        });
+
+        const guides = res.data?.resource_response?.data?.guides ?? [];
+        const terms  = guides
+            .map(g => g?.display_name || g?.term)
+            .filter(Boolean)
+            .slice(0, 8);
+
+        if (terms.length > 0) {
+            const variants = [keyword, ...terms.map(t => `${keyword} ${t}`)];
+            guidedCache[keyword] = variants;
+            console.log(`🔍 Guides for "${keyword}": ${terms.join(', ')}`);
+            return variants;
+        }
+    } catch (err) {
+        console.warn(`⚠️ Could not fetch guides for "${keyword}": ${err.message}`);
+    }
+
+    const FALLBACK = ['pfp', 'game', 'dark', 'aesthetic', 'anime'];
+    const base = keyword.toLowerCase();
+    const variants = [keyword, ...FALLBACK.filter(s => !base.includes(s)).map(s => `${keyword} ${s}`)];
+    guidedCache[keyword] = variants;
+    return variants;
+}
+
+async function expandKeyword(kw) {
+    return fetchPinterestGuides(kw);
 }
 
 // ========== Slash Commands ==========
@@ -624,6 +810,14 @@ async function registerSlashCommands() {
     try {
         await rest.put(Routes.applicationCommands(CLIENT_ID), {
             body: [
+                new SlashCommandBuilder()
+                    .setName('help')
+                    .setDescription('Show all available bot commands and what they do'),
+
+                new SlashCommandBuilder()
+                    .setName('clearcache')
+                    .setDescription('Clear all internal caches (guided search, failed URLs, bookmarks)'),
+
                 new SlashCommandBuilder()
                     .setName('mode')
                     .setDescription('Toggle keyword selection mode between random and sequential'),
@@ -643,12 +837,31 @@ async function registerSlashCommands() {
 
                 new SlashCommandBuilder()
                     .setName('removekeyword')
-                    .setDescription('Remove a keyword from the Pinterest list by its number')
-                    .addIntegerOption(opt => opt
-                        .setName('number')
-                        .setDescription('The keyword number shown in /keywords')
+                    .setDescription('Remove a keyword from the Pinterest list')
+                    .addStringOption(opt => opt
+                        .setName('keyword')
+                        .setDescription('Choose a keyword from the list')
                         .setRequired(true)
-                        .setMinValue(1)
+                        .setAutocomplete(true)
+                    ),
+
+                new SlashCommandBuilder()
+                    .setName('expandkeyword')
+                    .setDescription('Toggle auto-expand: bot discovers Pinterest guided search variants and adds them automatically'),
+
+                new SlashCommandBuilder()
+                    .setName('editkeyword')
+                    .setDescription('Replace an existing keyword with a new one')
+                    .addStringOption(opt => opt
+                        .setName('keyword')
+                        .setDescription('Choose the keyword to edit')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                    )
+                    .addStringOption(opt => opt
+                        .setName('newkeyword')
+                        .setDescription('The replacement keyword (e.g. "chainsawman pfp")')
+                        .setRequired(true)
                     ),
             ]
         });
@@ -664,6 +877,7 @@ async function replyError(interaction, now, description) {
         embeds: [new EmbedBuilder()
             .setColor('#ED4245')
             .setAuthor({ name: 'Pinterest Bot — Unexpected Error', iconURL: interaction.client.user.displayAvatarURL() })
+            .setThumbnail(interaction.client.user.displayAvatarURL())
             .setTitle('⚙️  Something went wrong')
             .setDescription(description)
             .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
@@ -677,6 +891,20 @@ async function replyError(interaction, now, description) {
     } catch {}
 }
 
+// ========== Autocomplete Handler ==========
+pinterestBot.on('interactionCreate', async (interaction) => {
+    if (!interaction.isAutocomplete()) return;
+    if (!DEVELOPER_IDS.includes(interaction.user.id)) return await interaction.respond([]).catch(() => {});
+
+    const focused = interaction.options.getFocused().toLowerCase();
+    const choices = keywords
+        .filter(kw => kw.toLowerCase().includes(focused))
+        .slice(0, 25)
+        .map(kw => ({ name: kw, value: kw }));
+
+    await interaction.respond(choices).catch(() => {});
+});
+
 // ========== Interaction Handler ==========
 pinterestBot.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
@@ -686,6 +914,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
             embeds: [new EmbedBuilder()
                 .setColor('#ED4245')
                 .setAuthor({ name: 'Pinterest Bot — Access Denied', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
                 .setTitle('🔒  Unauthorized')
                 .setDescription('This command is restricted to **bot developers** only.')
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
@@ -697,8 +926,64 @@ pinterestBot.on('interactionCreate', async (interaction) => {
 
     const now = new Date();
 
+    // ── /clearcache ────────────────────────────────────────
+    if (interaction.commandName === 'clearcache') { try {
+        const guidedCount  = Object.keys(guidedCache).length;
+        const failedCount  = failedUrls.size;
+        const bookmarkCount = Object.keys(keywordBookmarks).length;
+
+        for (const k of Object.keys(guidedCache))    delete guidedCache[k];
+        failedUrls.clear();
+        for (const k of Object.keys(keywordBookmarks)) delete keywordBookmarks[k];
+        saveState();
+
+        await interaction.reply({
+            embeds: [new EmbedBuilder()
+                .setColor('#57F287')
+                .setAuthor({ name: 'Pinterest Bot — Cache Cleared', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
+                .setTitle('🧹  Cache cleared successfully')
+                .addFields(
+                    { name: '🔍  Guided cache',   value: `${guidedCount} entries removed`,   inline: true },
+                    { name: '🚫  Failed URLs',     value: `${failedCount} URLs unblocked`,    inline: true },
+                    { name: '🔖  Bookmarks',       value: `${bookmarkCount} pages reset`,     inline: true },
+                )
+                .setDescription('-# The bot can now re-fetch fresh data from Pinterest from scratch')
+                .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                .setTimestamp(now)
+            ],
+            ephemeral: true
+        });
+    } catch (err) { console.error(`❌ /clearcache error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
+
+    // ── /help ──────────────────────────────────────────────
+    else if (interaction.commandName === 'help') { try {
+        const botAvatar = interaction.client.user.displayAvatarURL();
+        await interaction.reply({
+            embeds: [new EmbedBuilder()
+                .setColor('#E60023')
+                .setAuthor({ name: 'Pinterest Bot — Help', iconURL: botAvatar })
+                .setThumbnail(botAvatar)
+                .setTitle('📖  الأوامر المتاحة')
+                .addFields(
+                    { name: '# /help',          value: '-# يعرض قائمة بكل الأوامر المتاحة وشرح لكل واحد' },
+                    { name: '# /clearcache',    value: '-# يمسح كل الـ cache الداخلي (guided search، روابط فاشلة، bookmarks)' },
+                    { name: '# /keywords',      value: '-# يعرض كل الكلمات المفعّلة، حجم الـ queue، والوضع الحالي' },
+                    { name: '## /addkeyword',    value: '-# يضيف كلمة بحث جديدة لقائمة Pinterest' },
+                    { name: '## /removekeyword', value: '-# يحذف كلمة بحث من القائمة (اختر من القائمة المنسدلة)' },
+                    { name: '## /editkeyword',   value: '-# يستبدل كلمة موجودة بكلمة جديدة (اختر القديمة وأدخل الجديدة)' },
+                    { name: '## /expandkeyword', value: '-# يشغّل أو يوقف التوسيع التلقائي للكلمات عبر Pinterest Guided Search' },
+                    { name: '## /mode',          value: '-# يبدّل بين وضعين: 🎲 عشوائي أو 🔁 ترتيبي' },
+                )
+                .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                .setTimestamp(now)
+            ],
+            ephemeral: true
+        });
+    } catch (err) { console.error(`❌ /help error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
+
     // ── /mode ──────────────────────────────────────────────
-    if (interaction.commandName === 'mode') { try {
+    else if (interaction.commandName === 'mode') { try {
         keywordMode = keywordMode === 'random' ? 'sequential' : 'random';
         if (keywordMode === 'sequential') _keywordIndex = 0;
         saveState();
@@ -710,12 +995,13 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         const modeDesc  = isRandom
             ? 'A keyword is picked **at random** every update.'
             : 'Keywords rotate **in order** every update.';
-        const kwList = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}`).join('\n') || '> *No keywords set*';
+        const kwList = (keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}`).join('\n') || '> *No keywords set*').slice(0, 1024);
 
         await interaction.reply({
             embeds: [new EmbedBuilder()
                 .setColor(modeColor)
                 .setAuthor({ name: 'Pinterest Bot — Mode Changed', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
                 .setTitle(`${modeEmoji}  Switched to ${modeLabel} mode`)
                 .setDescription(modeDesc)
                 .addFields(
@@ -738,6 +1024,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 embeds: [new EmbedBuilder()
                     .setColor('#FEE75C')
                     .setAuthor({ name: 'Pinterest Bot — Duplicate', iconURL: interaction.client.user.displayAvatarURL() })
+                    .setThumbnail(interaction.client.user.displayAvatarURL())
                     .setTitle('⚠️  Keyword already exists')
                     .setDescription(`\`${kw}\` is already in the list — no changes made.`)
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
@@ -762,6 +1049,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
             embeds: [new EmbedBuilder()
                 .setColor('#57F287')
                 .setAuthor({ name: 'Pinterest Bot — Keyword Added', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
                 .setTitle('✅  New keyword saved')
                 .addFields(
                     { name: '🆕  Added',         value: `\`${kw}\``,          inline: true },
@@ -781,12 +1069,13 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         const isRandom  = keywordMode === 'random';
         const modeEmoji = isRandom ? '🎲' : '🔁';
         const modeLabel = isRandom ? 'Random' : 'Sequential';
-        const kwList    = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}`).join('\n') || '> *No keywords set*';
+        const kwList    = (keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}`).join('\n') || '> *No keywords set*').slice(0, 1024);
 
         await interaction.reply({
             embeds: [new EmbedBuilder()
                 .setColor('#E60023')
                 .setAuthor({ name: 'Pinterest Bot — Keywords', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
                 .setTitle('📋  Active Keywords')
                 .addFields(
                     { name: `${modeEmoji}  Mode`,  value: modeLabel,              inline: true },
@@ -803,16 +1092,17 @@ pinterestBot.on('interactionCreate', async (interaction) => {
 
     // ── /removekeyword ─────────────────────────────────────
     else if (interaction.commandName === 'removekeyword') { try {
-        const num = interaction.options.getInteger('number');
-        const idx = num - 1;
+        const kw  = interaction.options.getString('keyword');
+        const idx = keywords.indexOf(kw);
 
-        if (idx >= keywords.length) {
+        if (idx === -1) {
             return interaction.reply({
                 embeds: [new EmbedBuilder()
                     .setColor('#ED4245')
                     .setAuthor({ name: 'Pinterest Bot — Error', iconURL: interaction.client.user.displayAvatarURL() })
-                    .setTitle('❌  Invalid number')
-                    .setDescription(`Number \`${num}\` is out of range — there are only **${keywords.length}** keyword${keywords.length !== 1 ? 's' : ''}.`)
+                    .setThumbnail(interaction.client.user.displayAvatarURL())
+                    .setTitle('❌  Keyword not found')
+                    .setDescription(`\`${kw}\` is not in the current list.`)
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                     .setTimestamp(now)
                 ],
@@ -825,6 +1115,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 embeds: [new EmbedBuilder()
                     .setColor('#FEE75C')
                     .setAuthor({ name: 'Pinterest Bot — Warning', iconURL: interaction.client.user.displayAvatarURL() })
+                    .setThumbnail(interaction.client.user.displayAvatarURL())
                     .setTitle('⚠️  Cannot remove last keyword')
                     .setDescription('At least one keyword must remain in the list.')
                     .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
@@ -834,22 +1125,22 @@ pinterestBot.on('interactionCreate', async (interaction) => {
             });
         }
 
-        const removed = keywords.splice(idx, 1)[0];
+        keywords.splice(idx, 1);
         if (_keywordIndex > 0) _keywordIndex = Math.min(_keywordIndex, keywords.length - 1);
-        delete keywordBookmarks[removed];
-        // Remove any queued items from this keyword
-        imageQueue = imageQueue.filter(item => item.keyword !== removed);
+        delete keywordBookmarks[kw];
+        imageQueue = imageQueue.filter(item => item.keyword !== kw);
         saveState();
 
-        const kwList = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}`).join('\n') || '> *No keywords set*';
+        const kwList = (keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}`).join('\n') || '> *No keywords set*').slice(0, 1024);
 
         await interaction.reply({
             embeds: [new EmbedBuilder()
                 .setColor('#ED4245')
                 .setAuthor({ name: 'Pinterest Bot — Keyword Removed', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
                 .setTitle('🗑️  Keyword removed')
                 .addFields(
-                    { name: '❌  Removed',   value: `\`${removed}\``,      inline: true },
+                    { name: '❌  Removed',   value: `\`${kw}\``,           inline: true },
                     { name: '📊  Remaining', value: `${keywords.length}`,   inline: true },
                     { name: '─────────────────', value: kwList }
                 )
@@ -859,6 +1150,124 @@ pinterestBot.on('interactionCreate', async (interaction) => {
             ephemeral: true
         });
     } catch (err) { console.error(`❌ /removekeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
+
+    // ── /expandkeyword ─────────────────────────────────────
+    else if (interaction.commandName === 'expandkeyword') { try {
+        autoExpand = !autoExpand;
+        saveState();
+
+        const isOn     = autoExpand;
+        const color    = isOn ? '#57F287' : '#ED4245';
+        const emoji    = isOn ? '✅' : '❌';
+        const label    = isOn ? 'Enabled' : 'Disabled';
+        const desc     = isOn
+            ? 'The bot will automatically discover Pinterest Guided Search variants and add them on every fetch cycle.'
+            : 'The bot will not auto-expand keywords — it works only on the keywords already in the list.';
+
+        await interaction.reply({
+            embeds: [new EmbedBuilder()
+                .setColor(color)
+                .setAuthor({ name: 'Pinterest Bot — Auto-Expand', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
+                .setTitle(`${emoji}  Auto-Expand ${label}`)
+                .setDescription(desc)
+                .addFields(
+                    { name: '🔍  Status',  value: label,              inline: true },
+                    { name: '📊  Keywords', value: `${keywords.length}`, inline: true },
+                )
+                .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                .setTimestamp(now)
+            ],
+            ephemeral: true
+        });
+    } catch (err) { console.error(`❌ /expandkeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
+
+    // ── /editkeyword ──────────────────────────────────────
+    else if (interaction.commandName === 'editkeyword') { try {
+        const oldKw = interaction.options.getString('keyword');
+        const newKw = interaction.options.getString('newkeyword').trim();
+        const idx   = keywords.indexOf(oldKw);
+
+        if (idx === -1) {
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor('#ED4245')
+                    .setAuthor({ name: 'Pinterest Bot — Error', iconURL: interaction.client.user.displayAvatarURL() })
+                    .setThumbnail(interaction.client.user.displayAvatarURL())
+                    .setTitle('❌  Keyword not found')
+                    .setDescription(`\`${oldKw}\` is not in the current list.`)
+                    .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                    .setTimestamp(now)
+                ],
+                ephemeral: true
+            });
+        }
+
+        if (oldKw === newKw) {
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor('#FEE75C')
+                    .setAuthor({ name: 'Pinterest Bot — No Change', iconURL: interaction.client.user.displayAvatarURL() })
+                    .setThumbnail(interaction.client.user.displayAvatarURL())
+                    .setTitle('⚠️  Same keyword')
+                    .setDescription(`The new keyword is identical to the current one — no changes made.`)
+                    .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                    .setTimestamp(now)
+                ],
+                ephemeral: true
+            });
+        }
+
+        if (keywords.includes(newKw)) {
+            return interaction.reply({
+                embeds: [new EmbedBuilder()
+                    .setColor('#FEE75C')
+                    .setAuthor({ name: 'Pinterest Bot — Duplicate', iconURL: interaction.client.user.displayAvatarURL() })
+                    .setThumbnail(interaction.client.user.displayAvatarURL())
+                    .setTitle('⚠️  Keyword already exists')
+                    .setDescription(`\`${newKw}\` is already in the list at another position — no changes made.`)
+                    .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                    .setTimestamp(now)
+                ],
+                ephemeral: true
+            });
+        }
+
+        // Replace the keyword in-place (same slot number)
+        keywords[idx] = newKw;
+
+        // Clean up state tied to the old keyword
+        delete keywordBookmarks[oldKw];
+        delete guidedCache[oldKw];
+        imageQueue = imageQueue.filter(item => item.keyword !== oldKw);
+
+        saveState();
+
+        // Pre-fetch new keyword in background
+        fetchOneKeyword(newKw).then(n => {
+            if (n > 0) { saveState(); console.log(`  ✅ Pre-fetched ${n} from edited keyword "${newKw}"`); }
+        }).catch(() => {});
+
+        const kwList = keywords.map((k, i) => `> \`${String(i + 1).padStart(2, '0')}.\` ${k}${i === idx ? '  ← **edited**' : ''}`).join('\n').slice(0, 1024);
+
+        await interaction.reply({
+            embeds: [new EmbedBuilder()
+                .setColor('#5865F2')
+                .setAuthor({ name: 'Pinterest Bot — Keyword Edited', iconURL: interaction.client.user.displayAvatarURL() })
+                .setThumbnail(interaction.client.user.displayAvatarURL())
+                .setTitle('✏️  Keyword updated')
+                .addFields(
+                    { name: '❌  Old',  value: `\`${oldKw}\``,        inline: true },
+                    { name: '✅  New',  value: `\`${newKw}\``,        inline: true },
+                    { name: '🔢  Slot', value: `#${idx + 1}`,         inline: true },
+                    { name: '📋  Full list', value: kwList }
+                )
+                .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
+                .setTimestamp(now)
+            ],
+            ephemeral: true
+        });
+    } catch (err) { console.error(`❌ /editkeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 });
 
 // ========== Bot Startup ==========
