@@ -25,7 +25,7 @@ const USER_AGENTS = [
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'MzE4MzY5Mzg2NA.GLw68H.hDnOI0L1fcnfiXqYWrSQb6wTUhzh0mr-wOVXg4';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'MTMzY5Mzg2NA.GLw68H.hDnOI0L1fcnfiXqYWrSQb6wTUhzh0mr-wOVXg4';
 const CLIENT_ID       = process.env.CLIENT_ID || '1481717883183693864';
 
 if (!TOKEN_PINTEREST) {
@@ -40,11 +40,11 @@ const PINTEREST_CHANNEL_ID = '1484325879764226109';
 const DEVELOPER_IDS = ['1384688131374317598', '1471245404501839966'];
 
 // ========== Image Settings ==========
-const DEFAULT_KEYWORDS        = ['full images'];
+const DEFAULT_KEYWORDS        = ['chainsawman pfp 1 and 2'];
 const PINTEREST_CHANGE_INTERVAL = 30;   // seconds between posts
 const QUEUE_MIN               = 20;      // refill when queue drops below this
 const QUEUE_TARGET            = 100;      // how many URLs to keep ready
-const SEEN_MAX                = 10000000;    // max seen-URL history
+const SEEN_MAX                = 50000;       // max seen-URL history (kept in RAM + JSON)
 const FAILED_URLS_MAX         = 1000;    // max blacklisted URLs to keep in memory
 const MAX_AUTO_KEYWORDS       = 40;      // max total keywords (base + auto-expanded)
 
@@ -97,14 +97,35 @@ function loadState() {
     console.log('📂 New state file created');
 }
 
-function saveState() {
+let _saveInProgress = false;
+let _pendingSave    = false;
+
+async function saveState() {
+    // Coalesce rapid saves: if a write is already in-flight, just flag "save again when done"
+    if (_saveInProgress) { _pendingSave = true; return; }
+    _saveInProgress = true;
     try {
-        const seenArr = [...seenIds].slice(-SEEN_MAX);
-        const data = JSON.stringify({ keywords, keywordMode, keywordIndex: _keywordIndex, autoExpand, keywordBookmarks, seenIds: seenArr, autoExpandedKeywords: [...autoExpandedKeywords] }, null, 2);
-        if (fs.existsSync(STATE_FILE)) fs.copyFileSync(STATE_FILE, STATE_BACKUP_FILE);
-        fs.writeFileSync(STATE_FILE, data, 'utf8');
+        // Trim seenIds in-memory too so the Set never balloons past SEEN_MAX
+        if (seenIds.size > SEEN_MAX) {
+            seenIds = new Set([...seenIds].slice(-SEEN_MAX));
+        }
+        const data = JSON.stringify({
+            keywords,
+            keywordMode,
+            keywordIndex: _keywordIndex,
+            autoExpand,
+            keywordBookmarks,
+            seenIds: [...seenIds],
+            autoExpandedKeywords: [...autoExpandedKeywords],
+        }, null, 2);
+        // Atomic-ish write: backup → write new file
+        await fs.promises.copyFile(STATE_FILE, STATE_BACKUP_FILE).catch(() => {});
+        await fs.promises.writeFile(STATE_FILE, data, 'utf8');
     } catch (err) {
         console.error(`❌ Error saving state: ${err.message}`);
+    } finally {
+        _saveInProgress = false;
+        if (_pendingSave) { _pendingSave = false; saveState(); }
     }
 }
 
@@ -176,13 +197,14 @@ function videoToGif(videoBuffer, videoExt) {
         const outFile  = path.join(tmpDir, `pin_out_${Date.now()}.gif`);
         const palFile  = path.join(tmpDir, `pin_pal_${Date.now()}.png`);
 
-        try { fs.writeFileSync(inFile, videoBuffer); } catch (e) { return reject(e); }
-
         const cleanup = () => {
             for (const f of [inFile, outFile, palFile]) {
                 try { if (fs.existsSync(f)) fs.unlinkSync(f); } catch {}
             }
         };
+
+        // Write input file — cleanup if it fails so tmp files don't accumulate
+        try { fs.writeFileSync(inFile, videoBuffer); } catch (e) { cleanup(); return reject(e); }
 
         // Step 1: generate palette for better GIF quality
         execFile('ffmpeg', [
@@ -260,33 +282,42 @@ function pickKeyword() {
 // Pick the highest-quality static image URL from a pin's images object.
 function bestImageUrl(images) {
     if (!images) return null;
-    return (
-        images?.orig?.url      ||
-        images?.['1200x']?.url ||
-        images?.['736x']?.url  ||
-        images?.['600x']?.url  ||
-        images?.['474x']?.url  ||
-        images?.['236x']?.url  ||
-        null
-    );
+    // Try keys in descending quality order; also handle objects with a direct `url` string
+    const candidates = [
+        images?.orig?.url,
+        images?.['1500x']?.url,
+        images?.['1200x']?.url,
+        images?.['736x']?.url,
+        images?.['600x']?.url,
+        images?.['474x']?.url,
+        images?.['236x']?.url,
+    ];
+    for (const u of candidates) {
+        if (u && typeof u === 'string' && u.startsWith('http')) return u;
+    }
+    // Last resort: find any string value that looks like a URL
+    for (const val of Object.values(images)) {
+        if (val?.url && typeof val.url === 'string' && val.url.startsWith('http')) return val.url;
+    }
+    return null;
 }
 
 // Pick the highest-quality video URL from a pin's video_list object.
-// Pinterest orders video_list keys like V_720P, V_480P, V_360P, V_HLS …
+// Pinterest orders video_list keys like V_1080P, V_720P, V_480P, V_360P, V_HLS …
 function bestVideoUrl(videoList) {
     if (!videoList || typeof videoList !== 'object') return null;
     // HLS (.m3u8) playlists can't be downloaded with a simple GET — skip them
     const isDownloadable = url => url?.startsWith('http') && !url.includes('.m3u8');
-    const PREF = ['V_720P', 'V_480P', 'V_360P'];
+    const PREF = ['V_1080P', 'V_720P', 'V_480P', 'V_360P', 'V_240P'];
     for (const key of PREF) {
         const url = videoList[key]?.url;
         if (isDownloadable(url)) return url;
     }
-    // Fallback: take the first directly downloadable URL
-    for (const val of Object.values(videoList)) {
-        if (isDownloadable(val?.url)) return val.url;
-    }
-    return null;
+    // Fallback: take the highest-resolution directly downloadable URL by key sort
+    const sorted = Object.entries(videoList)
+        .filter(([, v]) => isDownloadable(v?.url))
+        .sort(([a], [b]) => b.localeCompare(a));
+    return sorted[0]?.[1]?.url ?? null;
 }
 
 // Build realistic browser headers for a given UA to reduce Pinterest blocking.
@@ -359,20 +390,46 @@ async function fetchPinterestPage(keyword, bookmark) {
             continue;
         }
 
-        // 2. Carousel pin — multiple images in one pin
+        // 2. Carousel pin — multiple images/videos in one pin
         const carouselSlots = r?.carousel_data?.carousel_slots;
         if (carouselSlots && carouselSlots.length > 1) {
             const urls = carouselSlots
-                .map(slot => bestImageUrl(slot?.images))
-                .filter(Boolean)
-                .map(upgradeToOriginals);
+                .map(slot => {
+                    // Prefer video inside a carousel slot when available
+                    const slotVideo = bestVideoUrl(slot?.videos?.video_list);
+                    if (slotVideo) return slotVideo;
+                    const img = bestImageUrl(slot?.images);
+                    return img ? upgradeToOriginals(img) : null;
+                })
+                .filter(Boolean);
             if (urls.length > 0) {
                 items.push({ url: urls[0], urls, pinId });
                 continue;
             }
         }
 
-        // 3. Fall back to best static image, upgraded to originals resolution
+        // 3. Story Pin — extract all images from story blocks
+        const storyBlocks = r?.story_pin_data?.pages;
+        if (storyBlocks && storyBlocks.length > 0) {
+            const urls = storyBlocks
+                .flatMap(page => page?.blocks ?? [])
+                .map(block => {
+                    const blockVideo = bestVideoUrl(block?.video?.video_list);
+                    if (blockVideo) return blockVideo;
+                    const img = bestImageUrl(block?.image?.images);
+                    return img ? upgradeToOriginals(img) : null;
+                })
+                .filter(Boolean);
+            if (urls.length > 1) {
+                items.push({ url: urls[0], urls, pinId });
+                continue;
+            } else if (urls.length === 1) {
+                items.push({ url: urls[0], pinId });
+                continue;
+            }
+        }
+
+        // 4. Fall back to best static image, upgraded to originals resolution
         const imgUrl = bestImageUrl(r?.images);
         if (imgUrl) items.push({ url: upgradeToOriginals(imgUrl), pinId });
     }
@@ -596,11 +653,23 @@ function dequeueNext() {
 }
 
 // ========== Image Download ==========
+// Build a fallback URL chain for Pinterest CDN images:
+//   originals → 1500x → 1200x → 736x → original URL
+function buildPinterestUrlChain(url) {
+    if (!url.includes('pinimg.com')) return [url];
+    const make = (size) => url.replace(/\/(?:originals|\d+x)\//, `/${size}/`);
+    const originals = url.replace(/\/(?:originals|\d+x)\//, '/originals/');
+    const chain = [originals];
+    for (const size of ['1500x', '1200x', '736x']) {
+        const candidate = make(size);
+        if (candidate !== originals && candidate !== url) chain.push(candidate);
+    }
+    if (!chain.includes(url)) chain.push(url);
+    return [...new Set(chain)];
+}
+
 async function downloadImage(url) {
-    // For Pinterest CDN images, try upgrading to originals first for best quality.
-    // If originals returns a non-200 (e.g. 403/404), fall back to the original URL.
-    const originalsUrl = upgradeToOriginals(url);
-    const urlsToTry    = originalsUrl !== url ? [originalsUrl, url] : [url];
+    const urlsToTry = buildPinterestUrlChain(url);
 
     let lastErr;
     for (const tryUrl of urlsToTry) {
@@ -624,7 +693,11 @@ async function downloadImage(url) {
             }, 3);
         } catch (err) {
             lastErr = err;
-            if (urlsToTry.length > 1) console.warn(`⚠️ Download failed for ${tryUrl.includes('originals') ? 'originals' : 'sized'} URL — trying fallback...`);
+            if (urlsToTry.length > 1) {
+                const label = tryUrl.includes('originals') ? 'originals'
+                    : (tryUrl.match(/\/(\d+x)\//) ?? ['', tryUrl])[1];
+                console.warn(`⚠️ Download failed for [${label}] — trying next fallback...`);
+            }
         }
     }
     throw lastErr;
@@ -657,7 +730,7 @@ function buildCarouselComponents(msgId, page, total) {
             .setCustomId(`c_next_${msgId}`)
             .setLabel('التالي ▶')
             .setStyle(ButtonStyle.Primary)
-         //   .setDisabled(page === total - 1),
+            .setDisabled(page === total - 1),
     )];
 }
 
@@ -669,10 +742,20 @@ async function updatePinterestAvatar() {
         fillQueue().catch(err => console.error(`❌ Background fill failed: ${err.message}`));
     }
 
-    // If queue empty, wait for first fill to complete
+    // If queue empty, wait — either for the already-running fill or start a fresh one
     if (imageQueue.length === 0) {
         console.warn('⏳ Queue empty — waiting for fill...');
-        await fillQueue();
+        if (isFetching) {
+            // A fill is already in progress; poll until it finishes (max 30s)
+            await new Promise(resolve => {
+                const check = setInterval(() => {
+                    if (!isFetching || imageQueue.length > 0) { clearInterval(check); resolve(); }
+                }, 500);
+                setTimeout(() => { clearInterval(check); resolve(); }, 30000);
+            });
+        } else {
+            await fillQueue();
+        }
         if (imageQueue.length === 0) {
             console.error('❌ Queue still empty after fill — skipping this cycle');
             return;
@@ -736,18 +819,44 @@ async function updatePinterestAvatar() {
         const cdnCache    = { 0: firstCdnUrl };
 
         // Register session BEFORE editing so buttons work even if edit is slow
-        carouselSessions.set(sent.id, { cdnCache, sourceUrls: orderedUrls, page: 0, keyword: item.keyword, total });
+        const session = { cdnCache, sourceUrls: orderedUrls, page: 0, keyword: item.keyword, total };
+        carouselSessions.set(sent.id, session);
         setTimeout(() => carouselSessions.delete(sent.id), 30 * 60 * 1000);
 
-        // Edit to use CDN URL (persistent) + proper nav buttons with real message ID
+        // Edit to CDN URL + remove the file attachment so nothing appears outside the embed.
+        // attachments: [] strips the uploaded file; the embed now uses a persistent CDN URL.
         try {
             await sent.edit({
-                embeds:     [buildCarouselEmbed(firstCdnUrl || `attachment://${firstName}`, item.keyword, 0, total)],
-                components: buildCarouselComponents(sent.id, 0, total),
+                attachments: [],
+                embeds:      [buildCarouselEmbed(firstCdnUrl || `attachment://${firstName}`, item.keyword, 0, total)],
+                components:  buildCarouselComponents(sent.id, 0, total),
             });
         } catch (editErr) {
             console.warn(`⚠️ Carousel edit failed (buttons may be missing): ${editErr.message}`);
         }
+
+        // Background pre-fetch remaining carousel pages so navigation is instant
+        ;(async () => {
+            for (let i = 1; i < orderedUrls.length; i++) {
+                if (!carouselSessions.has(sent.id)) break; // session expired, stop
+                if (session.cdnCache[i]) continue;         // already cached
+                try {
+                    const dl = await downloadImage(orderedUrls[i]);
+                    let buf = dl.buffer, fmt = dl.format;
+                    if (dl.size > MAX_DISCORD_SIZE) {
+                        buf = await sharp(buf).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+                        fmt = 'jpg';
+                    }
+                    const prefetched = await channel.send({
+                        files: [new AttachmentBuilder(buf, { name: `image.${fmt}` })],
+                        embeds: [new EmbedBuilder().setDescription('\u200b')],
+                    });
+                    const cdnUrl = [...prefetched.attachments.values()][0]?.url ?? '';
+                    if (cdnUrl) session.cdnCache[i] = cdnUrl;
+                    await prefetched.delete().catch(() => {});
+                } catch { /* silent — user will trigger on-demand download instead */ }
+            }
+        })();
 
         console.log(`✅ Carousel sent (${total} images, paginated) | queue: ${imageQueue.length}`);
         saveState();
@@ -947,8 +1056,20 @@ const guidedCache = {};
 async function fetchPinterestGuides(keyword) {
     if (guidedCache[keyword]) return guidedCache[keyword];
 
+    const ua = randomUA();
+    const filterTerms = (rawTerms) => rawTerms
+        .filter(Boolean)
+        .filter(t => {
+            const words = t.trim().split(/\s+/);
+            if (words.length > 2) return false;
+            if (words.some(w => /^[A-Z]/.test(w))) return false;
+            if (keyword.toLowerCase().includes(t.toLowerCase())) return false;
+            return true;
+        })
+        .slice(0, 5);
+
+    // --- Attempt 1: GuideSearchResource ---
     try {
-        const ua = randomUA();
         const source_url = `/search/pins/?q=${encodeURIComponent(keyword)}&rs=typed`;
         const payload = JSON.stringify({
             options: { query: keyword, scope: 'pins' },
@@ -962,23 +1083,44 @@ async function fetchPinterestGuides(keyword) {
         });
 
         const guides = res.data?.resource_response?.data?.guides ?? [];
-
-        const terms = guides
-            .map(g => g?.display_name || g?.term)
-            .filter(Boolean)
-            .filter(t => {
-                const words = t.trim().split(/\s+/);
-                if (words.length > 2) return false;
-                if (words.some(w => /^[A-Z]/.test(w))) return false;
-                if (keyword.toLowerCase().includes(t.toLowerCase())) return false;
-                return true;
-            })
-            .slice(0, 5);
+        const terms = filterTerms(guides.map(g => g?.display_name || g?.term));
 
         if (terms.length > 0) {
             const variants = [keyword, ...terms.map(t => `${keyword} ${t}`)];
             guidedCache[keyword] = variants;
             console.log(`🔍 Guides for "${keyword}": ${terms.join(', ')}`);
+            return variants;
+        }
+    } catch (err) {
+        if (err.response?.status !== 404) {
+            console.log(`ℹ️ GuideSearch failed for "${keyword}" (${err.message}) — trying TypeaheadResource`);
+        }
+    }
+
+    // --- Attempt 2: TypeaheadResource (fallback) ---
+    try {
+        const payload = JSON.stringify({
+            options: { term: keyword, scope: 'pins' },
+            context: {}
+        });
+        const source_url = `/search/pins/?q=${encodeURIComponent(keyword)}&rs=typed`;
+        const url = `https://www.pinterest.com/resource/TypeaheadResource/get/?source_url=${encodeURIComponent(source_url)}&data=${encodeURIComponent(payload)}`;
+
+        const res = await axios.get(url, {
+            timeout: 15000,
+            headers: pinterestHeaders(ua, keyword),
+        });
+
+        const items = res.data?.resource_response?.data?.items ?? [];
+        const rawTerms = items
+            .filter(i => i?.type === 'term')
+            .map(i => i?.display_name || i?.term);
+        const terms = filterTerms(rawTerms);
+
+        if (terms.length > 0) {
+            const variants = [keyword, ...terms.map(t => `${keyword} ${t}`)];
+            guidedCache[keyword] = variants;
+            console.log(`🔍 Typeahead for "${keyword}": ${terms.join(', ')}`);
             return variants;
         }
     } catch (err) {
@@ -1112,8 +1254,9 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         // Use cached CDN URL if available
         if (session.cdnCache[page]) {
             await interaction.update({
-                embeds:     [buildCarouselEmbed(session.cdnCache[page], session.keyword, page, session.total)],
-                components: buildCarouselComponents(sessionId, page, session.total),
+                attachments: [],
+                embeds:      [buildCarouselEmbed(session.cdnCache[page], session.keyword, page, session.total)],
+                components:  buildCarouselComponents(sessionId, page, session.total),
             });
         } else {
             // Download image on-demand from the post's own URLs only
@@ -1147,19 +1290,38 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 });
             }
 
-            const fileName = `image.${fmt}`;
-            const edited = await interaction.message.edit({
-                files:      [new AttachmentBuilder(buf, { name: fileName })],
-                embeds:     [buildCarouselEmbed(`attachment://${fileName}`, session.keyword, page, session.total)],
-                components: buildCarouselComponents(sessionId, page, session.total),
-            });
-            const cdnUrl = [...edited.attachments.values()][0]?.url ?? '';
-            if (cdnUrl) session.cdnCache[page] = cdnUrl;
-            if (cdnUrl) {
-                await edited.edit({
-                    embeds:     [buildCarouselEmbed(cdnUrl, session.keyword, page, session.total)],
-                    components: buildCarouselComponents(sessionId, page, session.total),
+            // Upload the image to a temp message to obtain a persistent Discord CDN URL,
+            // then immediately delete it. This lets us edit the carousel embed using only
+            // an external CDN URL — so no file attachment is left on the message and
+            // nothing appears outside the embed.
+            const fileName  = `image.${fmt}`;
+            let cdnUrl = '';
+            try {
+                const tempMsg = await interaction.channel.send({
+                    files: [new AttachmentBuilder(buf, { name: fileName })],
                 });
+                cdnUrl = [...tempMsg.attachments.values()][0]?.url ?? '';
+                await tempMsg.delete().catch(() => {});
+            } catch { /* fallback: leave cdnUrl empty */ }
+
+            if (cdnUrl) {
+                // Use CDN URL directly in the embed — no file attachment on the carousel message
+                await interaction.editReply({
+                    attachments: [],
+                    embeds:      [buildCarouselEmbed(cdnUrl, session.keyword, page, session.total)],
+                    components:  buildCarouselComponents(sessionId, page, session.total),
+                });
+                session.cdnCache[page] = cdnUrl;
+            } else {
+                // CDN upload failed — fall back to attachment:// (image may appear outside embed)
+                const edited = await interaction.message.edit({
+                    attachments: [],
+                    files:       [new AttachmentBuilder(buf, { name: fileName })],
+                    embeds:      [buildCarouselEmbed(`attachment://${fileName}`, session.keyword, page, session.total)],
+                    components:  buildCarouselComponents(sessionId, page, session.total),
+                });
+                const fallbackCdn = [...edited.attachments.values()][0]?.url ?? '';
+                if (fallbackCdn) session.cdnCache[page] = fallbackCdn;
             }
         }
     } catch (err) {
