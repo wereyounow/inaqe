@@ -25,7 +25,7 @@ const USER_AGENTS = [
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'4MzE4MzY5Mzg2NA.GAVqqG.MotfSK_4UrPFpxlABC39p34JAlSxN8WU1732tk';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'zg4MzE4MzY5Mzg2NA.GLw68H.hDnOI0L1fcnfiXqYWrSQb6wTUhzh0mr-wOVXg4';
 const CLIENT_ID       = process.env.CLIENT_ID || '1481717883183693864';
 
 if (!TOKEN_PINTEREST) {
@@ -45,6 +45,8 @@ const PINTEREST_CHANGE_INTERVAL = 30;   // seconds between posts
 const QUEUE_MIN               = 20;      // refill when queue drops below this
 const QUEUE_TARGET            = 100;      // how many URLs to keep ready
 const SEEN_MAX                = 10000000;    // max seen-URL history
+const FAILED_URLS_MAX         = 1000;    // max blacklisted URLs to keep in memory
+const MAX_AUTO_KEYWORDS       = 40;      // max total keywords (base + auto-expanded)
 
 const AVATARS_DIR = path.join(__dirname, 'avatars');
 if (!fs.existsSync(AVATARS_DIR)) fs.mkdirSync(AVATARS_DIR, { recursive: true });
@@ -53,12 +55,13 @@ if (!fs.existsSync(AVATARS_DIR)) fs.mkdirSync(AVATARS_DIR, { recursive: true });
 const STATE_FILE        = path.join(__dirname, 'avatar_state.json');
 const STATE_BACKUP_FILE = STATE_FILE + '.backup';
 
-let keywords         = [...DEFAULT_KEYWORDS];
-let keywordMode      = 'random';
-let _keywordIndex    = 0;
-let autoExpand       = true;     // whether to auto-expand keywords via guided search when filling queue
-let keywordBookmarks = {};       // keyword -> Pinterest bookmark token
-let seenIds          = new Set(); // unique image IDs ever sent (dedup by content, not URL)
+let keywords             = [...DEFAULT_KEYWORDS];
+let keywordMode          = 'random';
+let _keywordIndex        = 0;
+let autoExpand           = true;     // whether to auto-expand keywords via guided search when filling queue
+let keywordBookmarks     = {};       // keyword -> Pinterest bookmark token
+let seenIds              = new Set(); // unique image IDs ever sent (dedup by content, not URL)
+let autoExpandedKeywords = new Set(); // tracks which keywords were added by autoExpand (not user-added)
 
 // In-memory queue of { url, keyword } items ready to post
 let imageQueue    = [];
@@ -67,17 +70,21 @@ let isFetching    = false;
 // URLs that failed all download retries — skip them permanently this session
 const failedUrls  = new Set();
 
+// ── Carousel pagination sessions: messageId → { cdnUrls, page, keyword, total } ──
+const carouselSessions = new Map();
+
 function loadState() {
     for (const file of [STATE_FILE, STATE_BACKUP_FILE]) {
         try {
             if (fs.existsSync(file)) {
                 const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-                keywords         = data.keywords         ?? [...DEFAULT_KEYWORDS];
-                keywordMode      = data.keywordMode      ?? 'random';
-                _keywordIndex    = data.keywordIndex     ?? 0;
-                autoExpand       = data.autoExpand       ?? true;
-                keywordBookmarks = data.keywordBookmarks ?? {};
-                seenIds          = new Set(data.seenIds ?? []);
+                keywords             = data.keywords             ?? [...DEFAULT_KEYWORDS];
+                keywordMode          = data.keywordMode          ?? 'random';
+                _keywordIndex        = data.keywordIndex         ?? 0;
+                autoExpand           = data.autoExpand           ?? true;
+                keywordBookmarks     = data.keywordBookmarks     ?? {};
+                seenIds              = new Set(data.seenIds      ?? []);
+                autoExpandedKeywords = new Set(data.autoExpandedKeywords ?? []);
                 console.log(`📂 State loaded | Seen: ${seenIds.size} | Keywords: ${keywords.length} | Mode: ${keywordMode}`);
                 return;
             }
@@ -93,7 +100,7 @@ function loadState() {
 function saveState() {
     try {
         const seenArr = [...seenIds].slice(-SEEN_MAX);
-        const data = JSON.stringify({ keywords, keywordMode, keywordIndex: _keywordIndex, autoExpand, keywordBookmarks, seenIds: seenArr }, null, 2);
+        const data = JSON.stringify({ keywords, keywordMode, keywordIndex: _keywordIndex, autoExpand, keywordBookmarks, seenIds: seenArr, autoExpandedKeywords: [...autoExpandedKeywords] }, null, 2);
         if (fs.existsSync(STATE_FILE)) fs.copyFileSync(STATE_FILE, STATE_BACKUP_FILE);
         fs.writeFileSync(STATE_FILE, data, 'utf8');
     } catch (err) {
@@ -373,6 +380,50 @@ async function fetchPinterestPage(keyword, bookmark) {
     return { items, nextBookmark };
 }
 
+// ========== Expansion Confidence Filter ==========
+// Fetches a small sample from an expanded keyword and checks whether the results
+// are actually relevant to the original keyword. Returns true if relevant.
+async function checkKeywordRelevance(originalKeyword, expandedKeyword, threshold = 0.30) {
+    try {
+        const ua = randomUA();
+        const source_url = `/search/pins/?q=${encodeURIComponent(expandedKeyword)}&rs=typed`;
+        const payload = JSON.stringify({
+            options: { query: expandedKeyword, scope: 'pins', page_size: 25 },
+            context: {}
+        });
+        const url = `https://www.pinterest.com/resource/BaseSearchResource/get/?source_url=${encodeURIComponent(source_url)}&data=${encodeURIComponent(payload)}`;
+
+        const res = await axios.get(url, { timeout: 15000, headers: pinterestHeaders(ua, expandedKeyword) });
+        const results = res.data?.resource_response?.data?.results ?? [];
+        if (results.length === 0) return false;
+
+        // Extract meaningful words from the ORIGINAL keyword (length > 2)
+        const originalWords = originalKeyword.toLowerCase().split(/\s+/).filter(w => w.length > 2);
+        if (originalWords.length === 0) return true;
+
+        // Check each pin's text fields against original keyword words
+        let matchCount = 0;
+        for (const r of results) {
+            const text = [
+                r?.grid_title,
+                r?.title,
+                r?.description,
+                r?.board?.name,
+                r?.pinner?.username,
+            ].filter(Boolean).join(' ').toLowerCase();
+
+            if (originalWords.some(word => text.includes(word))) matchCount++;
+        }
+
+        const ratio = matchCount / results.length;
+        console.log(`🔎 Relevance check "${expandedKeyword}": ${matchCount}/${results.length} (${Math.round(ratio * 100)}%) — ${ratio >= threshold ? '✅ accepted' : '❌ rejected'}`);
+        return ratio >= threshold;
+    } catch (err) {
+        console.warn(`⚠️ Relevance check failed for "${expandedKeyword}": ${err.message} — allowing by default`);
+        return true; // on network error, don't block expansion
+    }
+}
+
 // ========== Queue Filler ==========
 // Fetches pages for all keywords in parallel and adds fresh URLs to imageQueue.
 async function fillQueue() {
@@ -386,14 +437,36 @@ async function fillQueue() {
 
         // If auto-expand is on, discover guided search variants and add new ones before fetching
         if (autoExpand) {
-            const base = keywords.length > 0 ? [...keywords] : DEFAULT_KEYWORDS;
-            for (const kw of base) {
+            // Only expand BASE keywords (user-added), never expand auto-expanded variants
+            const baseOnly = keywords.filter(kw => !autoExpandedKeywords.has(kw));
+
+            for (const kw of baseOnly) {
+                // Stop expanding if we've hit the total keyword cap
+                if (keywords.length >= MAX_AUTO_KEYWORDS) {
+                    console.log(`⚠️ Keyword cap (${MAX_AUTO_KEYWORDS}) reached — skipping further expansion`);
+                    break;
+                }
+
                 const variants = await expandKeyword(kw).catch(() => []);
-                const toAdd = variants.filter(v => v !== kw && !keywords.includes(v));
-                for (const v of toAdd) keywords.push(v);
-                if (toAdd.length > 0) console.log(`🔍 Auto-expanded "${kw}" → +${toAdd.length} variants`);
+                const candidates = variants.filter(v => v !== kw && !keywords.includes(v));
+
+                // Confidence filter: only add variants whose results are relevant to the original keyword
+                const validated = [];
+                for (const v of candidates) {
+                    if (keywords.length >= MAX_AUTO_KEYWORDS) break;
+                    const relevant = await checkKeywordRelevance(kw, v).catch(() => true);
+                    if (relevant) validated.push(v);
+                    // Small delay between checks to avoid Pinterest rate limiting
+                    await new Promise(r => setTimeout(r, 300));
+                }
+
+                for (const v of validated) {
+                    keywords.push(v);
+                    autoExpandedKeywords.add(v);
+                }
+                if (validated.length > 0) console.log(`🔍 Auto-expanded "${kw}" → +${validated.length} variants (${candidates.length - validated.length} rejected by relevance filter)`);
             }
-            if (keywords.some((_,i) => i >= base.length)) saveState();
+            if (autoExpandedKeywords.size > 0) saveState();
         }
 
         // Fetch from every keyword in parallel, each responsible for its share
@@ -457,13 +530,13 @@ async function fetchOneKeyword(keyword, needed = QUEUE_TARGET) {
             // Dedup by pin ID (from API) first, then by parsed image filename as fallback.
             // This catches the same pin served under different size URLs.
             let pageAdded = 0;
-            for (const { url, pinId } of items) {
+            for (const { url, urls, pinId } of items) {
                 const fileId = getPinImageId(url);
                 const dedupKey = pinId ?? fileId;
                 if (!seenIds.has(dedupKey) && !seenIds.has(fileId)) {
                     seenIds.add(dedupKey);
                     seenIds.add(fileId);
-                    imageQueue.push({ url, keyword, id: dedupKey });
+                    imageQueue.push({ url, urls, keyword, id: dedupKey });
                     pageAdded++;
                     totalAdded++;
                 }
@@ -558,6 +631,36 @@ async function downloadImage(url) {
 }
 
 // ========== Image Update ==========
+// ── Carousel embed helpers ────────────────────────────────────
+function buildCarouselEmbed(cdnUrl, keyword, page, total) {
+    return new EmbedBuilder()
+        .setTitle('Avatars — Pinterest')
+        .setDescription(`🔍 \`${keyword}\``)
+        .setImage(cdnUrl)
+        .setColor('#E60023')
+        .setFooter({ text: `🖼️  ${page + 1} / ${total}` });
+}
+
+function buildCarouselComponents(msgId, page, total) {
+    return [new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId(`c_prev_${msgId}`)
+            .setLabel('◀ السابق')
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(page === 0),
+        new ButtonBuilder()
+            .setCustomId(`c_info_${msgId}`)
+            .setLabel(`${page + 1} / ${total}`)
+            .setStyle(ButtonStyle.Secondary)
+            .setDisabled(true),
+        new ButtonBuilder()
+            .setCustomId(`c_next_${msgId}`)
+            .setLabel('التالي ▶')
+            .setStyle(ButtonStyle.Primary)
+            .setDisabled(page === total - 1),
+    )];
+}
+
 async function updatePinterestAvatar() {
     console.log(`\n🔄 [${new Date().toLocaleString()}] Updating...`);
 
@@ -589,7 +692,7 @@ async function updatePinterestAvatar() {
     console.log(`🖼️  [${item.keyword}] id: ${imageId} | queue: ${imageQueue.length} remaining`);
     console.log(`🔗 ${item.url}`);
 
-    // ── Carousel: download & send all images together ────────
+    // ── Carousel: paginated embed with Previous / Next buttons ──
     const isCarousel = Array.isArray(item.urls) && item.urls.length > 1;
     if (isCarousel) {
         let channel = pinterestBot.channels.cache.get(PINTEREST_CHANNEL_ID);
@@ -613,15 +716,23 @@ async function updatePinterestAvatar() {
             }
         }
         if (files.length === 0) { console.error('❌ All carousel images failed'); return; }
-        await channel.send({
-            embeds: [new EmbedBuilder()
-                .setTitle('Avatar — Pinterest')
-                .setDescription(`🔍 \`${item.keyword}\` ┃ 🖼️ ${files.length} صور`)
-                .setColor('#E60023')
-            ],
-            files,
+
+        // Upload all files first to obtain permanent Discord CDN URLs
+        const sent = await channel.send({ files });
+        const cdnUrls = [...sent.attachments.values()].map(a => a.url);
+        const total   = cdnUrls.length;
+
+        // Edit the message to show paginated embed (page 1) + nav buttons
+        await sent.edit({
+            embeds:     [buildCarouselEmbed(cdnUrls[0], item.keyword, 0, total)],
+            components: buildCarouselComponents(sent.id, 0, total),
         });
-        console.log(`✅ Carousel sent (${files.length} images) | queue: ${imageQueue.length}`);
+
+        // Store session for button interactions (auto-expire after 30 min)
+        carouselSessions.set(sent.id, { cdnUrls, page: 0, keyword: item.keyword, total });
+        setTimeout(() => carouselSessions.delete(sent.id), 30 * 60 * 1000);
+
+        console.log(`✅ Carousel sent (${total} images, paginated) | queue: ${imageQueue.length}`);
         saveState();
         return;
     }
@@ -799,6 +910,11 @@ async function updatePinterestAvatar() {
         if (!downloadOk) {
             // Download itself failed — blacklist so we never retry this URL
             failedUrls.add(item.url);
+            // Cap failedUrls to avoid unbounded memory growth
+            if (failedUrls.size > FAILED_URLS_MAX) {
+                const oldest = [...failedUrls].slice(0, failedUrls.size - FAILED_URLS_MAX);
+                for (const u of oldest) failedUrls.delete(u);
+            }
             console.warn(`⛔ URL blacklisted after repeated download failures: ${item.url}`);
         } else {
             // Download succeeded but Discord send failed — put it back to retry next cycle
@@ -828,10 +944,23 @@ async function fetchPinterestGuides(keyword) {
         });
 
         const guides = res.data?.resource_response?.data?.guides ?? [];
-        const terms  = guides
+
+        // Keep only style/format modifiers — reject proper nouns (capital letters)
+        // and multi-word phrases that are likely a different franchise or character.
+        const terms = guides
             .map(g => g?.display_name || g?.term)
             .filter(Boolean)
-            .slice(0, 8);
+            .filter(t => {
+                const words = t.trim().split(/\s+/);
+                // Skip if more than 2 words (likely a character/show name)
+                if (words.length > 2) return false;
+                // Skip if any word starts with uppercase (likely a proper noun)
+                if (words.some(w => /^[A-Z]/.test(w))) return false;
+                // Skip if the term already appears in the keyword (redundant)
+                if (keyword.toLowerCase().includes(t.toLowerCase())) return false;
+                return true;
+            })
+            .slice(0, 5);
 
         if (terms.length > 0) {
             const variants = [keyword, ...terms.map(t => `${keyword} ${t}`)];
@@ -843,11 +972,9 @@ async function fetchPinterestGuides(keyword) {
         console.warn(`⚠️ Could not fetch guides for "${keyword}": ${err.message}`);
     }
 
-    const FALLBACK = ['pfp', 'game', 'dark', 'aesthetic', 'anime'];
-    const base = keyword.toLowerCase();
-    const variants = [keyword, ...FALLBACK.filter(s => !base.includes(s)).map(s => `${keyword} ${s}`)];
-    guidedCache[keyword] = variants;
-    return variants;
+    // No valid guides found — use the keyword as-is without guessing expansions
+    guidedCache[keyword] = [keyword];
+    return [keyword];
 }
 
 async function expandKeyword(kw) {
@@ -941,6 +1068,34 @@ async function replyError(interaction, now, description) {
     } catch {}
 }
 
+// ========== Carousel Button Handler ==========
+pinterestBot.on('interactionCreate', async (interaction) => {
+    if (!interaction.isButton()) return;
+    const { customId } = interaction;
+    if (!customId.startsWith('c_prev_') && !customId.startsWith('c_next_')) return;
+
+    const isPrev      = customId.startsWith('c_prev_');
+    const sessionId   = customId.slice(7); // strip 'c_prev_' or 'c_next_'
+    const session     = carouselSessions.get(sessionId);
+
+    if (!session) {
+        return interaction.reply({ content: '⏱️ انتهت صلاحية هذا الكاروسيل.', ephemeral: true });
+    }
+
+    session.page = isPrev
+        ? Math.max(0, session.page - 1)
+        : Math.min(session.total - 1, session.page + 1);
+
+    try {
+        await interaction.update({
+            embeds:     [buildCarouselEmbed(session.cdnUrls[session.page], session.keyword, session.page, session.total)],
+            components: buildCarouselComponents(sessionId, session.page, session.total),
+        });
+    } catch (err) {
+        console.error(`❌ Carousel button update failed: ${err.message}`);
+    }
+});
+
 // ========== Autocomplete Handler ==========
 pinterestBot.on('interactionCreate', async (interaction) => {
     if (!interaction.isAutocomplete()) return;
@@ -978,13 +1133,20 @@ pinterestBot.on('interactionCreate', async (interaction) => {
 
     // ── /clearcache ────────────────────────────────────────
     if (interaction.commandName === 'clearcache') { try {
-        const guidedCount  = Object.keys(guidedCache).length;
-        const failedCount  = failedUrls.size;
-        const bookmarkCount = Object.keys(keywordBookmarks).length;
+        const guidedCount    = Object.keys(guidedCache).length;
+        const failedCount    = failedUrls.size;
+        const bookmarkCount  = Object.keys(keywordBookmarks).length;
+        const expandedCount  = autoExpandedKeywords.size;
+        const queueCount     = imageQueue.length;
 
-        for (const k of Object.keys(guidedCache))    delete guidedCache[k];
-        failedUrls.clear();
+        // Remove all auto-expanded keyword variants from the keywords list
+        keywords = keywords.filter(kw => !autoExpandedKeywords.has(kw));
+        autoExpandedKeywords.clear();
+
+        for (const k of Object.keys(guidedCache))      delete guidedCache[k];
         for (const k of Object.keys(keywordBookmarks)) delete keywordBookmarks[k];
+        failedUrls.clear();
+        imageQueue = [];
         saveState();
 
         await interaction.reply({
@@ -994,9 +1156,11 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setThumbnail(interaction.client.user.displayAvatarURL())
                 .setTitle('🧹  Cache cleared successfully')
                 .addFields(
-                    { name: '🔍  Guided cache',   value: `${guidedCount} entries removed`,   inline: true },
-                    { name: '🚫  Failed URLs',     value: `${failedCount} URLs unblocked`,    inline: true },
-                    { name: '🔖  Bookmarks',       value: `${bookmarkCount} pages reset`,     inline: true },
+                    { name: '🔍  Guided cache',      value: `${guidedCount} entries removed`,    inline: true },
+                    { name: '🚫  Failed URLs',        value: `${failedCount} URLs unblocked`,     inline: true },
+                    { name: '🔖  Bookmarks',          value: `${bookmarkCount} pages reset`,      inline: true },
+                    { name: '🗂️  Queue flushed',      value: `${queueCount} items cleared`,       inline: true },
+                    { name: '🔍  Auto-expanded kws',  value: `${expandedCount} variants removed`, inline: true },
                 )
                 .setDescription('-# The bot can now re-fetch fresh data from Pinterest from scratch')
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
@@ -1085,6 +1249,8 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         }
 
         keywords.push(kw);
+        // User-added keywords are always base — never auto-expanded variants
+        autoExpandedKeywords.delete(kw);
         saveState();
 
         // Immediately fetch this new keyword in background
@@ -1176,6 +1342,7 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         }
 
         keywords.splice(idx, 1);
+        autoExpandedKeywords.delete(kw);
         if (_keywordIndex > 0) _keywordIndex = Math.min(_keywordIndex, keywords.length - 1);
         delete keywordBookmarks[kw];
         imageQueue = imageQueue.filter(item => item.keyword !== kw);
@@ -1285,6 +1452,13 @@ pinterestBot.on('interactionCreate', async (interaction) => {
 
         // Replace the keyword in-place (same slot number)
         keywords[idx] = newKw;
+
+        // Transfer auto-expand status: if old was auto-expanded, new is too;
+        // if user is manually editing an auto-expanded one, keep its classification.
+        if (autoExpandedKeywords.has(oldKw)) {
+            autoExpandedKeywords.delete(oldKw);
+            autoExpandedKeywords.add(newKw);
+        }
 
         // Clean up state tied to the old keyword
         delete keywordBookmarks[oldKw];
