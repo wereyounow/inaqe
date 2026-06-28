@@ -25,7 +25,7 @@ const USER_AGENTS = [
 ];
 
 // ========== Tokens ==========
-const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'MTQ4MTcxzE4MzY5Mzg2NA.GAVqqG.MotfSK_4UrPFpxlABC39p34JAlSxN8WU1732tk';
+const TOKEN_PINTEREST = process.env.TOKEN_PINTEREST ||'4MzE4MzY5Mzg2NA.GAVqqG.MotfSK_4UrPFpxlABC39p34JAlSxN8WU1732tk';
 const CLIENT_ID       = process.env.CLIENT_ID || '1481717883183693864';
 
 if (!TOKEN_PINTEREST) {
@@ -34,13 +34,13 @@ if (!TOKEN_PINTEREST) {
 }
 
 // ========== Channel IDs ==========
-const PINTEREST_CHANNEL_ID = '1519470579508445194';
+const PINTEREST_CHANNEL_ID = '1484325879764226109';
 
 // ========== Developer IDs ==========
 const DEVELOPER_IDS = ['1384688131374317598', '1471245404501839966'];
 
 // ========== Image Settings ==========
-const DEFAULT_KEYWORDS        = ['chainsawman icon', 'chainsawan aki Icon','Lara Croft icon','Cat icon'];
+const DEFAULT_KEYWORDS        = ['chainsawman icon', 'chainsawan aki Icon', 'Lara Croft icon', 'Cat icon'];
 const PINTEREST_CHANGE_INTERVAL = 30;   // seconds between posts
 const QUEUE_MIN               = 20;      // refill when queue drops below this
 const QUEUE_TARGET            = 100;      // how many URLs to keep ready
@@ -107,7 +107,7 @@ process.on('SIGINT',  () => { saveState(); process.exit(0); });
 
 // ========== Bot Instance ==========
 const pinterestBot = new Client({
-    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages],
+    intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
 });
 
 // ========== Utility ==========
@@ -352,7 +352,20 @@ async function fetchPinterestPage(keyword, bookmark) {
             continue;
         }
 
-        // 2. Fall back to best static image, upgraded to originals resolution
+        // 2. Carousel pin — multiple images in one pin
+        const carouselSlots = r?.carousel_data?.carousel_slots;
+        if (carouselSlots && carouselSlots.length > 1) {
+            const urls = carouselSlots
+                .map(slot => bestImageUrl(slot?.images))
+                .filter(Boolean)
+                .map(upgradeToOriginals);
+            if (urls.length > 0) {
+                items.push({ url: urls[0], urls, pinId });
+                continue;
+            }
+        }
+
+        // 3. Fall back to best static image, upgraded to originals resolution
         const imgUrl = bestImageUrl(r?.images);
         if (imgUrl) items.push({ url: upgradeToOriginals(imgUrl), pinId });
     }
@@ -575,6 +588,43 @@ async function updatePinterestAvatar() {
     const imageId = item.id ?? getPinImageId(item.url);
     console.log(`🖼️  [${item.keyword}] id: ${imageId} | queue: ${imageQueue.length} remaining`);
     console.log(`🔗 ${item.url}`);
+
+    // ── Carousel: download & send all images together ────────
+    const isCarousel = Array.isArray(item.urls) && item.urls.length > 1;
+    if (isCarousel) {
+        let channel = pinterestBot.channels.cache.get(PINTEREST_CHANNEL_ID);
+        if (!channel) {
+            try { channel = await pinterestBot.channels.fetch(PINTEREST_CHANNEL_ID); }
+            catch (err) { console.error(`❌ Could not access channel: ${err.message}`); return; }
+        }
+        const MAX_DISCORD_SIZE = 8 * 1024 * 1024;
+        const files = [];
+        for (let i = 0; i < Math.min(item.urls.length, 10); i++) {
+            try {
+                const dl = await downloadImage(item.urls[i]);
+                let buf = dl.buffer, fmt = dl.format;
+                if (dl.size > MAX_DISCORD_SIZE) {
+                    buf = await sharp(buf).resize({ width: 1280, withoutEnlargement: true }).jpeg({ quality: 85 }).toBuffer();
+                    fmt = 'jpg';
+                }
+                files.push(new AttachmentBuilder(buf, { name: `carousel_${i + 1}.${fmt}` }));
+            } catch (e) {
+                console.warn(`⚠️ Carousel image ${i + 1} failed: ${e.message}`);
+            }
+        }
+        if (files.length === 0) { console.error('❌ All carousel images failed'); return; }
+        await channel.send({
+            embeds: [new EmbedBuilder()
+                .setTitle('Avatar — Pinterest')
+                .setDescription(`🔍 \`${item.keyword}\` ┃ 🖼️ ${files.length} صور`)
+                .setColor('#E60023')
+            ],
+            files,
+        });
+        console.log(`✅ Carousel sent (${files.length} images) | queue: ${imageQueue.length}`);
+        saveState();
+        return;
+    }
 
     let downloadOk = false;
     try {
@@ -965,15 +1015,15 @@ pinterestBot.on('interactionCreate', async (interaction) => {
                 .setAuthor({ name: 'Pinterest Bot — Help', iconURL: botAvatar })
                 .setThumbnail(botAvatar)
                 .setTitle('📖  الأوامر المتاحة')
-                .addFields(
-                    { name: '# /help',          value: '-# يعرض قائمة بكل الأوامر المتاحة وشرح لكل واحد' },
-                    { name: '# /clearcache',    value: '-# يمسح كل الـ cache الداخلي (guided search، روابط فاشلة، bookmarks)' },
-                    { name: '# /keywords',      value: '-# يعرض كل الكلمات المفعّلة، حجم الـ queue، والوضع الحالي' },
-                    { name: '## /addkeyword',    value: '-# يضيف كلمة بحث جديدة لقائمة Pinterest' },
-                    { name: '## /removekeyword', value: '-# يحذف كلمة بحث من القائمة (اختر من القائمة المنسدلة)' },
-                    { name: '## /editkeyword',   value: '-# يستبدل كلمة موجودة بكلمة جديدة (اختر القديمة وأدخل الجديدة)' },
-                    { name: '## /expandkeyword', value: '-# يشغّل أو يوقف التوسيع التلقائي للكلمات عبر Pinterest Guided Search' },
-                    { name: '## /mode',          value: '-# يبدّل بين وضعين: 🎲 عشوائي أو 🔁 ترتيبي' },
+                .setDescription(
+                    '# /help\n-# يعرض قائمة بكل الأوامر المتاحة وشرح لكل واحد\n\n' +
+                    '# /clearcache\n-# يمسح كل الـ cache الداخلي (guided search، روابط فاشلة، bookmarks)\n\n' +
+                    '# /keywords\n-# يعرض كل الكلمات المفعّلة، حجم الـ queue، والوضع الحالي\n\n' +
+                    '# /addkeyword\n-# يضيف كلمة بحث جديدة لقائمة Pinterest\n\n' +
+                    '# /removekeyword\n-# يحذف كلمة بحث من القائمة (اختر من القائمة المنسدلة)\n\n' +
+                    '# /editkeyword\n-# يستبدل كلمة موجودة بكلمة جديدة (اختر القديمة وأدخل الجديدة)\n\n' +
+                    '# /expandkeyword\n-# يشغّل أو يوقف التوسيع التلقائي للكلمات عبر Pinterest Guided Search\n\n' +
+                    '# /mode\n-# يبدّل بين وضعين: 🎲 عشوائي أو 🔁 ترتيبي'
                 )
                 .setFooter({ text: `Requested by ${interaction.user.username}`, iconURL: interaction.user.displayAvatarURL() })
                 .setTimestamp(now)
@@ -1269,6 +1319,92 @@ pinterestBot.on('interactionCreate', async (interaction) => {
         });
     } catch (err) { console.error(`❌ /editkeyword error: ${err.message}`); await replyError(interaction, now, `\`${err.message}\``); } }
 });
+
+// ========== Fetch Images From A Specific Pin URL ==========
+async function fetchImagesFromPinUrl(pinUrl) {
+    // Resolve short URLs (pin.it)
+    let fullUrl = pinUrl;
+    if (pinUrl.includes('pin.it')) {
+        const res = await axios.get(pinUrl, { maxRedirects: 10, headers: { 'User-Agent': randomUA() } });
+        fullUrl = res.request.res.responseUrl || pinUrl;
+    }
+
+    // Extract pin ID
+    const pinId = fullUrl.match(/\/pin\/(\d+)/)?.[1];
+    if (!pinId) throw new Error('ما قدرت أستخرج Pin ID من الرابط');
+
+    // Fetch page HTML
+    const page = await axios.get(`https://www.pinterest.com/pin/${pinId}/`, {
+        headers: { 'User-Agent': randomUA(), 'Accept': 'text/html', 'Accept-Language': 'en-US,en;q=0.9' },
+        timeout: 20000,
+    });
+    const html = page.data;
+
+    // ── Try to parse structured JSON embedded in the page ──
+    const scriptMatch = html.match(/\{"props":\{"initialReduxState":\{.+\}\},"page"/s)
+                     || html.match(/__PWS_INITIAL_PROPS__\s*=\s*(\{.+?\});\s*<\/script>/s)
+                     || html.match(/__PWS_DATA__\s*=\s*(\{.+?\});\s*<\/script>/s);
+
+    if (scriptMatch) {
+        try {
+            const raw = scriptMatch[1] || scriptMatch[0];
+            const data = JSON.parse(raw);
+            const pins = data?.props?.initialReduxState?.pins || data?.resourceResponses?.[0]?.response?.data;
+            const pin  = pins?.[pinId] || (Array.isArray(pins) ? pins[0] : null);
+
+            if (pin) {
+                // Carousel
+                const slots = pin?.carousel_data?.carousel_slots;
+                if (slots?.length > 0) {
+                    const imgs = slots.map(s => bestImageUrl(s?.images)).filter(Boolean).map(upgradeToOriginals);
+                    if (imgs.length > 0) return { images: imgs, videoUrl: null, pinId };
+                }
+                // Video
+                const videoUrl = bestVideoUrl(pin?.videos?.video_list);
+                if (videoUrl) return { images: [], videoUrl, pinId };
+                // Single image
+                const imgUrl = bestImageUrl(pin?.images);
+                if (imgUrl) return { images: [upgradeToOriginals(imgUrl)], videoUrl: null, pinId };
+            }
+        } catch (_) {}
+    }
+
+    // ── Fallback: extract images strictly from pin-specific JSON blobs ──
+    // Only match 32-char hex filenames (actual content images, not UI assets)
+    const videoMatch = html.match(/https:\/\/v\d*\.pinimg\.com\/videos\/[^"'\s]+\.mp4/);
+
+    // Find pin image URLs embedded in JSON strings (escaped)
+    const jsonImgMatches = [...html.matchAll(/\\u002F(?:originals|736x|564x|474x)\\u002F([a-f0-9]{2})\\u002F([a-f0-9]{2})\\u002F([a-f0-9]{2})\\u002F([a-f0-9]{32}\.[a-z]{3,4})/g)];
+    if (jsonImgMatches.length > 0) {
+        const seen = new Set();
+        const imgs = [];
+        for (const m of jsonImgMatches) {
+            const url = `https://i.pinimg.com/originals/${m[1]}/${m[2]}/${m[3]}/${m[4]}`;
+            if (!seen.has(m[4])) { seen.add(m[4]); imgs.push(url); }
+        }
+        if (imgs.length > 0) return { images: imgs, videoUrl: videoMatch?.[0] || null, pinId };
+    }
+
+    // Last resort: raw URL match but ONLY 32-char hex filenames
+    // First, collect all URLs that are inside CSS url(...) to exclude them
+    const cssUrls = new Set(
+        [...html.matchAll(/url\(\s*['"]?(https:\/\/i\.pinimg\.com\/[^'"\)\s]+)['"]?\s*\)/g)].map(m => {
+            const fname = m[1].match(/\/([a-f0-9]{32}\.[a-z]{3,4})$/)?.[1];
+            return fname || null;
+        }).filter(Boolean)
+    );
+
+    const rawMatches = [...html.matchAll(/https:\/\/i\.pinimg\.com\/(?:originals|736x|564x|474x)\/[a-f0-9]{2}\/[a-f0-9]{2}\/[a-f0-9]{2}\/([a-f0-9]{32}\.[a-z]{3,4})/g)];
+    const byFilename = {};
+    for (const m of rawMatches) {
+        if (!byFilename[m[1]] && !cssUrls.has(m[1])) {
+            byFilename[m[1]] = m[0].replace(/\/(?:736x|564x|474x)\//, '/originals/');
+        }
+    }
+    const images = Object.values(byFilename);
+
+    return { images, videoUrl: videoMatch?.[0] || null, pinId };
+}
 
 // ========== Bot Startup ==========
 pinterestBot.once('ready', async () => {
